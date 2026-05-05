@@ -20,6 +20,8 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <fstream>
+#include <vector>
 #include <sstream>
 #include <string>
 
@@ -90,6 +92,85 @@ namespace {
     Eval::NNUE::verify();
 
     sync_cout << "\n" << Eval::trace(p) << sync_endl;
+  }
+
+
+  namespace {
+    constexpr size_t PS_DATA_BITS = 11744;
+    struct PackedSfen { uint8_t data[PS_DATA_BITS / 8]; };
+    struct PackedSfenValue {
+      PackedSfen sfen;
+      int16_t score;
+      uint16_t move;
+      int8_t gamePly;
+      int8_t game_result;
+      int8_t padding;
+    };
+    static_assert(sizeof(PackedSfenValue) == PS_DATA_BITS / 8 + 8, "Unexpected packed sfen size");
+
+    bool decode_packed_sfen_to_fen(const PackedSfen&, std::string&) {
+      // Fairy-Stockfish does not currently expose a packed-sfen decoder in src/.
+      // Keep this stub so eval-relabel compiles and can be wired to a native decoder later.
+      return false;
+    }
+  }
+
+  void eval_relabel(Position& pos, StateListPtr& states, const string& teacher, const string& input, const string& output) {
+
+    Options["UCI_Variant"] = "janggimodern";
+    Options["EvalFile"] = teacher;
+
+    states = StateListPtr(new std::deque<StateInfo>(1));
+    const Variant* variant = variants.find(Options["UCI_Variant"])->second;
+    pos.set(variant, variant->startFen, Options["UCI_Chess960"], &states->back(), Threads.main(), false);
+
+    Eval::NNUE::init();
+    Eval::NNUE::verify();
+
+    ifstream fin(input, ios::binary);
+    ofstream fout(output, ios::binary);
+
+    if (!fin || !fout) {
+      sync_cout << "info string eval-relabel: failed to open input or output file" << sync_endl;
+      return;
+    }
+
+    constexpr size_t BATCH = 1 << 14;
+    vector<PackedSfenValue> batch(BATCH);
+    uint64_t total = 0;
+
+    bool warnedNoDecoder = false;
+    while (fin) {
+      fin.read(reinterpret_cast<char*>(batch.data()), static_cast<std::streamsize>(sizeof(PackedSfenValue) * batch.size()));
+      size_t got = static_cast<size_t>(fin.gcount()) / sizeof(PackedSfenValue);
+      if (!got)
+        break;
+
+      uint64_t skipped = 0;
+      for (size_t i = 0; i < got; ++i) {
+        std::string fen;
+        if (!decode_packed_sfen_to_fen(batch[i].sfen, fen)) {
+          ++skipped;
+          continue;
+        }
+
+        StateInfo st;
+        Position p;
+        p.set(variant, fen, Options["UCI_Chess960"], &st, Threads.main(), false);
+        batch[i].score = static_cast<int16_t>(Eval::evaluate(p));
+      }
+
+      if (!warnedNoDecoder && skipped == got) {
+        sync_cout << "info string eval-relabel: no packed-sfen decoder available in Fairy-Stockfish src; entries left unchanged" << sync_endl;
+        warnedNoDecoder = true;
+      }
+      fout.write(reinterpret_cast<const char*>(batch.data()), static_cast<std::streamsize>(sizeof(PackedSfenValue) * got));
+      total += got;
+      if ((total & ((1ULL << 20) - 1)) == 0)
+        sync_cout << "info string eval-relabel processed " << total << " entries" << sync_endl;
+    }
+
+    sync_cout << "info string eval-relabel done " << total << " entries" << sync_endl;
   }
 
 
@@ -390,6 +471,13 @@ void UCI::loop(int argc, char* argv[]) {
       else if (token == "d")        sync_cout << pos << sync_endl;
       else if (token == "eval")     trace_eval(pos);
       else if (token == "compiler") sync_cout << compiler_info() << sync_endl;
+      else if (token == "eval-relabel") {
+          string teacher, input, output;
+          if (!(is >> teacher >> input >> output))
+              sync_cout << "info string usage: eval-relabel <teacher.nnue> <input.binpack> <output.binpack>" << sync_endl;
+          else
+              eval_relabel(pos, states, teacher, input, output);
+      }
       else if (token == "export_net")
       {
           std::optional<std::string> filename;
