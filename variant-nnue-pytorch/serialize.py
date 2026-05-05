@@ -39,7 +39,7 @@ class NNUEWriter():
 
     fc_hash = self.fc_hash(model)
     self.write_header(model, fc_hash, description)
-    self.int32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    self.int32(model.feature_set.hash ^ (model.l1_size*2)) # Feature transformer hash
     self.write_feature_transformer(model)
     for l1, l2, output in model.layer_stacks.get_coalesced_layer_stacks():
       self.int32(fc_hash) # FC layers hash
@@ -51,7 +51,7 @@ class NNUEWriter():
   def fc_hash(model):
     # InputSlice hash
     prev_hash = 0xEC42E90D
-    prev_hash ^= (M.L1 * 2)
+    prev_hash ^= (model.l1_size * 2)
 
     # Fully connected layers
     layers = [model.layer_stacks.l1, model.layer_stacks.l2, model.layer_stacks.output]
@@ -68,7 +68,9 @@ class NNUEWriter():
 
   def write_header(self, model, fc_hash, description):
     self.int32(VERSION) # version
-    self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    self.int32(fc_hash ^ model.feature_set.hash ^ (model.l1_size*2)) # halfkp network hash
+    self.int32(model.l1_size)
+    self.int32(model.l2_size)
     encoded_description = description.encode('utf-8')
     self.int32(len(encoded_description)) # Network definition
     self.buf.extend(encoded_description)
@@ -77,14 +79,14 @@ class NNUEWriter():
     # int16 bias = round(x * 127)
     # int16 weight = round(x * 127)
     layer = model.input
-    bias = layer.bias.data[:M.L1]
+    bias = layer.bias.data[:model.l1_size]
     bias = bias.mul(127).round().to(torch.int16)
     ascii_hist('ft bias:', bias.numpy())
     self.buf.extend(bias.flatten().numpy().tobytes())
 
     weight = M.coalesce_ft_weights(model, layer)
-    weight0 = weight[:, :M.L1]
-    psqtweight0 = weight[:, M.L1:]
+    weight0 = weight[:, :model.l1_size]
+    psqtweight0 = weight[:, model.l1_size:]
     weight = weight0.mul(127).round().to(torch.int16)
     psqtweight = psqtweight0.mul(9600).round().to(torch.int32) # kPonanzaConstant * FV_SCALE = 9600
     ascii_hist('ft weight:', weight.numpy())
@@ -133,32 +135,40 @@ class NNUEReader():
   def __init__(self, f, feature_set):
     self.f = f
     self.feature_set = feature_set
-    self.model = M.NNUE(feature_set)
+    self.model = None
+    l1_size, l2_size = self.read_header(feature_set)
+    self.model = M.NNUE(feature_set, l1_size=l1_size, l2_size=l2_size)
     fc_hash = NNUEWriter.fc_hash(self.model)
-
-    self.read_header(feature_set, fc_hash)
-    self.read_int32(feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    self.read_int32(feature_set.hash ^ (self.model.l1_size*2)) # Feature transformer hash
     self.read_feature_transformer(self.model.input, self.model.num_psqt_buckets)
     for i in range(self.model.num_ls_buckets):
-      l1 = nn.Linear(2*M.L1, M.L2)
-      l2 = nn.Linear(M.L2, M.L3)
+      l1 = nn.Linear(2*self.model.l1_size, self.model.l2_size)
+      l2 = nn.Linear(self.model.l2_size, M.L3)
       output = nn.Linear(M.L3, 1)
       self.read_int32(fc_hash) # FC layers hash
       self.read_fc_layer(l1)
       self.read_fc_layer(l2)
       self.read_fc_layer(output, is_output=True)
-      self.model.layer_stacks.l1.weight.data[i*M.L2:(i+1)*M.L2, :] = l1.weight
-      self.model.layer_stacks.l1.bias.data[i*M.L2:(i+1)*M.L2] = l1.bias
+      self.model.layer_stacks.l1.weight.data[i*self.model.l2_size:(i+1)*self.model.l2_size, :] = l1.weight
+      self.model.layer_stacks.l1.bias.data[i*self.model.l2_size:(i+1)*self.model.l2_size] = l1.bias
       self.model.layer_stacks.l2.weight.data[i*M.L3:(i+1)*M.L3, :] = l2.weight
       self.model.layer_stacks.l2.bias.data[i*M.L3:(i+1)*M.L3] = l2.bias
       self.model.layer_stacks.output.weight.data[i:(i+1), :] = output.weight
       self.model.layer_stacks.output.bias.data[i:(i+1)] = output.bias
 
-  def read_header(self, feature_set, fc_hash):
+  def read_header(self, feature_set):
     self.read_int32(VERSION) # version
-    self.read_int32(fc_hash ^ feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    net_hash = self.read_int32()
+    l1_size = self.read_int32()
+    l2_size = self.read_int32()
+    temp_model = M.NNUE(feature_set, l1_size=l1_size, l2_size=l2_size)
+    fc_hash = NNUEWriter.fc_hash(temp_model)
+    expected = fc_hash ^ feature_set.hash ^ (l1_size * 2)
+    if net_hash != expected:
+      raise Exception("Expected: %x, got %x" % (expected, net_hash))
     desc_len = self.read_int32() # Network definition
     description = self.f.read(desc_len)
+    return l1_size, l2_size
 
   def tensor(self, dtype, shape):
     d = numpy.fromfile(self.f, dtype, reduce(operator.mul, shape, 1))
