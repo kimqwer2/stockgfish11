@@ -107,6 +107,12 @@ namespace {
       int8_t padding;
     };
     static_assert(sizeof(PackedSfenValue) == PS_DATA_BITS / 8 + 8, "Unexpected packed sfen size");
+
+    bool decode_packed_sfen_to_fen(const PackedSfen&, std::string&) {
+      // Fairy-Stockfish does not currently expose a packed-sfen decoder in src/.
+      // Keep this stub so eval-relabel compiles and can be wired to a native decoder later.
+      return false;
+    }
   }
 
   void eval_relabel(Position& pos, StateListPtr& states, const string& teacher, const string& input, const string& output) {
@@ -133,20 +139,31 @@ namespace {
     vector<PackedSfenValue> batch(BATCH);
     uint64_t total = 0;
 
+    bool warnedNoDecoder = false;
     while (fin) {
       fin.read(reinterpret_cast<char*>(batch.data()), static_cast<std::streamsize>(sizeof(PackedSfenValue) * batch.size()));
       size_t got = static_cast<size_t>(fin.gcount()) / sizeof(PackedSfenValue);
       if (!got)
         break;
 
+      uint64_t skipped = 0;
       for (size_t i = 0; i < got; ++i) {
-        Position p;
-        StateInfo st;
-        if (p.set_from_packed_sfen(batch[i].sfen, &st, Threads.main()) == 0)
+        std::string fen;
+        if (!decode_packed_sfen_to_fen(batch[i].sfen, fen)) {
+          ++skipped;
           continue;
+        }
+
+        StateInfo st;
+        Position p;
+        p.set(variant, fen, Options["UCI_Chess960"], &st, Threads.main(), false);
         batch[i].score = static_cast<int16_t>(Eval::evaluate(p));
       }
 
+      if (!warnedNoDecoder && skipped == got) {
+        sync_cout << "info string eval-relabel: no packed-sfen decoder available in Fairy-Stockfish src; entries left unchanged" << sync_endl;
+        warnedNoDecoder = true;
+      }
       fout.write(reinterpret_cast<const char*>(batch.data()), static_cast<std::streamsize>(sizeof(PackedSfenValue) * got));
       total += got;
       if ((total & ((1ULL << 20) - 1)) == 0)
