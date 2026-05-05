@@ -117,7 +117,7 @@ namespace {
 
   void eval_relabel(Position& pos, StateListPtr& states, const string& teacher, const string& input, const string& output) {
 
-    Options["UCI_Variant"] = "janggimodern";
+    Options["UCI_Variant"] = std::string("janggimodern");
     Options["EvalFile"] = teacher;
 
     states = StateListPtr(new std::deque<StateInfo>(1));
