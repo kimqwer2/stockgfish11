@@ -28,6 +28,8 @@
 
 namespace Stockfish::Eval::NNUE {
 
+  extern IndexType LoadedFeatureDimensions;
+
   using BiasType       = std::int16_t;
   using WeightType     = std::int16_t;
   using PSQTWeightType = std::int32_t;
@@ -197,9 +199,10 @@ namespace Stockfish::Eval::NNUE {
     // Read network parameters
     bool read_parameters(std::istream& stream) {
 
+      const IndexType dimensions = LoadedFeatureDimensions ? LoadedFeatureDimensions : FeatureSet::get_dimensions();
       read_little_endian<BiasType      >(stream, biases     , HalfDimensions                  );
-      read_little_endian<WeightType    >(stream, weights    , HalfDimensions * FeatureSet::get_dimensions());
-      read_little_endian<PSQTWeightType>(stream, psqtWeights, PSQTBuckets    * FeatureSet::get_dimensions());
+      read_little_endian<WeightType    >(stream, weights    , HalfDimensions * dimensions);
+      read_little_endian<PSQTWeightType>(stream, psqtWeights, PSQTBuckets    * dimensions);
 
       return !stream.fail();
     }
@@ -366,6 +369,8 @@ namespace Stockfish::Eval::NNUE {
    private:
     void update_accumulator(const Position& pos, const Color perspective) const {
 
+      const IndexType activeDimensions = LoadedFeatureDimensions ? LoadedFeatureDimensions : FeatureSet::get_dimensions();
+
       // The size must be enough to contain the largest possible update.
       // That might depend on the feature set and generally relies on the
       // feature set's update cost calculation to be correct and never
@@ -432,6 +437,7 @@ namespace Stockfish::Eval::NNUE {
             // Difference calculation for the deactivated features
             for (const auto index : removed[i])
             {
+              if (index >= activeDimensions) continue;
               const IndexType offset = HalfDimensions * index + j * TileHeight;
               auto column = reinterpret_cast<const vec_t*>(&weights[offset]);
               for (IndexType k = 0; k < NumRegs; ++k)
@@ -441,6 +447,7 @@ namespace Stockfish::Eval::NNUE {
             // Difference calculation for the activated features
             for (const auto index : added[i])
             {
+              if (index >= activeDimensions) continue;
               const IndexType offset = HalfDimensions * index + j * TileHeight;
               auto column = reinterpret_cast<const vec_t*>(&weights[offset]);
               for (IndexType k = 0; k < NumRegs; ++k)
@@ -468,6 +475,7 @@ namespace Stockfish::Eval::NNUE {
             // Difference calculation for the deactivated features
             for (const auto index : removed[i])
             {
+              if (index >= activeDimensions) continue;
               const IndexType offset = PSQTBuckets * index + j * PsqtTileHeight;
               auto columnPsqt = reinterpret_cast<const psqt_vec_t*>(&psqtWeights[offset]);
               for (std::size_t k = 0; k < NumPsqtRegs; ++k)
@@ -477,6 +485,7 @@ namespace Stockfish::Eval::NNUE {
             // Difference calculation for the activated features
             for (const auto index : added[i])
             {
+              if (index >= activeDimensions) continue;
               const IndexType offset = PSQTBuckets * index + j * PsqtTileHeight;
               auto columnPsqt = reinterpret_cast<const psqt_vec_t*>(&psqtWeights[offset]);
               for (std::size_t k = 0; k < NumPsqtRegs; ++k)
@@ -506,6 +515,7 @@ namespace Stockfish::Eval::NNUE {
           // Difference calculation for the deactivated features
           for (const auto index : removed[i])
           {
+            if (index >= activeDimensions) continue;
             const IndexType offset = HalfDimensions * index;
 
             for (IndexType j = 0; j < HalfDimensions; ++j)
@@ -518,6 +528,7 @@ namespace Stockfish::Eval::NNUE {
           // Difference calculation for the activated features
           for (const auto index : added[i])
           {
+            if (index >= activeDimensions) continue;
             const IndexType offset = HalfDimensions * index;
 
             for (IndexType j = 0; j < HalfDimensions; ++j)
@@ -547,6 +558,7 @@ namespace Stockfish::Eval::NNUE {
 
           for (const auto index : active)
           {
+            if (index >= activeDimensions) continue;
             const IndexType offset = HalfDimensions * index + j * TileHeight;
             auto column = reinterpret_cast<const vec_t*>(&weights[offset]);
 
@@ -567,6 +579,7 @@ namespace Stockfish::Eval::NNUE {
 
           for (const auto index : active)
           {
+            if (index >= activeDimensions) continue;
             const IndexType offset = PSQTBuckets * index + j * PsqtTileHeight;
             auto columnPsqt = reinterpret_cast<const psqt_vec_t*>(&psqtWeights[offset]);
 
@@ -589,6 +602,7 @@ namespace Stockfish::Eval::NNUE {
 
         for (const auto index : active)
         {
+          if (index >= activeDimensions) continue;
           const IndexType offset = HalfDimensions * index;
 
           for (IndexType j = 0; j < HalfDimensions; ++j)
