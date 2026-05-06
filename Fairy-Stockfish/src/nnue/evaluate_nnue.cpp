@@ -34,8 +34,6 @@
 
 namespace Stockfish::Eval::NNUE {
 
-  IndexType LoadedFeatureDimensions = 0;
-
   // Input feature converter
   LargePagePtr<FeatureTransformer> featureTransformer;
 
@@ -133,47 +131,12 @@ namespace Stockfish::Eval::NNUE {
     return !stream.fail();
   }
 
-  bool detect_feature_dimensions(std::istream& stream) {
-    const std::streampos paramsStart = stream.tellg();
-    stream.seekg(0, std::ios::end);
-    const std::streampos paramsEnd = stream.tellg();
-    stream.seekg(paramsStart);
-
-    if (!stream || paramsStart < 0 || paramsEnd < paramsStart)
-        return false;
-
-    constexpr std::size_t Layer1Input = ceil_to_multiple<IndexType>(TransformedFeatureDimensions * 2, MaxSimdWidth);
-    constexpr std::size_t Layer2Input = ceil_to_multiple<IndexType>(Layers::HiddenLayer1::OutputDimensions, MaxSimdWidth);
-    constexpr std::size_t OutputInput = ceil_to_multiple<IndexType>(Layers::HiddenLayer2::OutputDimensions, MaxSimdWidth);
-    constexpr std::size_t Layer1Bytes = Layers::HiddenLayer1::OutputDimensions * sizeof(std::int32_t)
-                                    + Layers::HiddenLayer1::OutputDimensions * Layer1Input * sizeof(std::int8_t);
-    constexpr std::size_t Layer2Bytes = Layers::HiddenLayer2::OutputDimensions * sizeof(std::int32_t)
-                                    + Layers::HiddenLayer2::OutputDimensions * Layer2Input * sizeof(std::int8_t);
-    constexpr std::size_t OutputBytes = Layers::OutputLayer::OutputDimensions * sizeof(std::int32_t)
-                                    + Layers::OutputLayer::OutputDimensions * OutputInput * sizeof(std::int8_t);
-    constexpr std::size_t NetworkBytes = LayerStacks * (Layer1Bytes + Layer2Bytes + OutputBytes);
-    constexpr std::size_t FtBiasBytes = TransformedFeatureDimensions * sizeof(BiasType);
-    constexpr std::size_t BytesPerFeature = TransformedFeatureDimensions * sizeof(WeightType) + PSQTBuckets * sizeof(PSQTWeightType);
-
-    const std::size_t remaining = static_cast<std::size_t>(paramsEnd - paramsStart);
-    if (remaining < NetworkBytes + FtBiasBytes)
-        return false;
-
-    const std::size_t featureBytes = remaining - NetworkBytes - FtBiasBytes;
-    if (featureBytes % BytesPerFeature != 0)
-        return false;
-
-    LoadedFeatureDimensions = static_cast<IndexType>(featureBytes / BytesPerFeature);
-    return LoadedFeatureDimensions <= FeatureTransformer::InputDimensions;
-  }
-
   // Read network parameters
   bool read_parameters(std::istream& stream) {
 
     std::uint32_t hashValue;
     if (!read_header(stream, &hashValue, &netDescription)) return false;
     if (hashValue != HashValue) return false;
-    if (!detect_feature_dimensions(stream)) return false;
     if (!Detail::read_parameters(stream, *featureTransformer)) return false;
     for (std::size_t i = 0; i < LayerStacks; ++i)
       if (!Detail::read_parameters(stream, *(network[i]))) return false;
