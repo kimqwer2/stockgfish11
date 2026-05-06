@@ -140,7 +140,11 @@ class NNUE(pl.LightningModule):
     self.l2_size = l2_size
     self.scale = scale
     self.input = DoubleFeatureTransformerSlice(feature_set.num_features, self.l1_size + self.num_psqt_buckets)
+    # Keep an explicit feature-count alias on the transformer so all forward-time
+    # index normalization uses the same bound as the CUDA feature transformer.
+    self.input.num_features = self.input.num_inputs
     self.feature_set = feature_set
+    self._printed_index_debug = False
     self.layer_stacks = LayerStacks(self.num_ls_buckets, self.l1_size, self.l2_size)
     self.lambda_ = lambda_
 
@@ -257,7 +261,28 @@ class NNUE(pl.LightningModule):
     else:
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
-  def forward(self, us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices):
+  def _debug_index_tensor(self, name, indices):
+    if indices.numel() == 0:
+      return '{}=empty'.format(name)
+    return '{} min={} max={}'.format(name, int(indices.min().detach().cpu()), int(indices.max().detach().cpu()))
+
+  def forward(self, us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices, debug_indices=False):
+    if not hasattr(self.input, 'num_features'):
+      self.input.num_features = self.input.num_inputs
+
+    if debug_indices and not getattr(self, '_printed_index_debug', False):
+      print('NNUE index debug before clamp: {}, {}, {}, {}'.format(
+        self._debug_index_tensor('white', white_indices),
+        self._debug_index_tensor('black', black_indices),
+        self._debug_index_tensor('psqt', psqt_indices),
+        self._debug_index_tensor('layer_stack', layer_stack_indices)), flush=True)
+      self._printed_index_debug = True
+
+    white_indices = torch.clamp(white_indices, 0, self.input.num_features - 1).to(dtype=torch.int32).contiguous()
+    black_indices = torch.clamp(black_indices, 0, self.input.num_features - 1).to(dtype=torch.int32).contiguous()
+    psqt_indices = torch.clamp(psqt_indices.to(dtype=torch.long), 0, self.num_psqt_buckets - 1)
+    layer_stack_indices = torch.clamp(layer_stack_indices.to(dtype=torch.long), 0, self.layer_stacks.count - 1)
+
     wp, bp = self.input(white_indices, white_values, black_indices, black_values)
     w, wpsqt = torch.split(wp, self.l1_size, dim=1)
     b, bpsqt = torch.split(bp, self.l1_size, dim=1)
@@ -277,7 +302,7 @@ class NNUE(pl.LightningModule):
 
     us, them, white_indices, white_values, black_indices, black_values, outcome, score, psqt_indices, layer_stack_indices = batch
 
-    student_logits = self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices).squeeze(-1)
+    student_logits = self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices, debug_indices=(batch_idx == 0)).squeeze(-1)
     teacher_prob = torch.sigmoid(score / self.scale)
     p_target = self.lambda_ * teacher_prob + (1.0 - self.lambda_) * outcome
 
