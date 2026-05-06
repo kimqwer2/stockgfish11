@@ -76,11 +76,19 @@ class LayerStacks(nn.Module):
     self.output.bias = nn.Parameter(output_bias)
 
   def forward(self, x, ls_indices):
-    # precompute and cache the offset for gathers
-    if self.idx_offset == None or self.idx_offset.shape[0] != x.shape[0]:
-      self.idx_offset = torch.arange(0,x.shape[0]*self.count,self.count, device=ls_indices.device)
+    # The C++ loader computes bucket ids from material count. Some variant
+    # datasets can produce a boundary value equal to the number of buckets,
+    # so clamp to the valid [0, count) range before using the ids for gathers.
+    ls_indices = ls_indices.flatten().to(device=x.device, dtype=torch.long).clamp(0, self.count - 1)
 
-    indices = ls_indices.flatten() + self.idx_offset
+    if ls_indices.numel() != x.shape[0]:
+      raise ValueError('Layer stack index count {} does not match batch size {}'.format(ls_indices.numel(), x.shape[0]))
+
+    # precompute and cache the offset for gathers
+    if self.idx_offset == None or self.idx_offset.shape[0] != x.shape[0] or self.idx_offset.device != x.device:
+      self.idx_offset = torch.arange(0, x.shape[0] * self.count, self.count, device=x.device, dtype=torch.long)
+
+    indices = ls_indices + self.idx_offset
 
     l1s_ = self.l1(x).reshape((-1, self.count, self.l2_size))
     l1f_ = self.l1_fact(x)
