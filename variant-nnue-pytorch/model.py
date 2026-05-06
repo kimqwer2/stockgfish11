@@ -300,25 +300,32 @@ class NNUE(pl.LightningModule):
   def step_(self, batch, batch_idx, loss_type):
     self._clip_weights()
 
-    us, them, white_indices, white_values, black_indices, black_values, outcome, score, psqt_indices, layer_stack_indices = batch
+    us, them, white_indices, white_values, black_indices, black_values, batch_wdl, batch_score, psqt_indices, layer_stack_indices = batch
 
-    student_logits = self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices, debug_indices=(batch_idx == 0)).view(-1)
-    outcome = outcome.view(-1)
-    score = score.view(-1)
+    student_logits = self(
+      us,
+      them,
+      white_indices,
+      white_values,
+      black_indices,
+      black_values,
+      psqt_indices,
+      layer_stack_indices,
+      debug_indices=(batch_idx == 0),
+    ).view(-1)
 
-    teacher_prob = torch.sigmoid(score / self.scale)
-    p_target = (self.lambda_ * teacher_prob + (1.0 - self.lambda_) * outcome).view(-1)
+    batch_score = batch_score.view(-1)
+    batch_wdl = batch_wdl.view(-1)
 
-    student_scaled_logits = (student_logits / self.scale).view(-1)
-    kd_loss = F.binary_cross_entropy_with_logits(student_scaled_logits, p_target)
-    loss_teacher_eval = F.binary_cross_entropy_with_logits(student_scaled_logits, teacher_prob.view(-1))
-    loss_wdl = F.binary_cross_entropy_with_logits(student_scaled_logits, outcome)
+    if batch_idx % 100 == 0:
+      print(f"SCORE_DEBUG: {batch_score[0].item()}")
 
-    self.log(loss_type, kd_loss)
-    self.log(f"{loss_type}_teacher_eval", loss_teacher_eval)
-    self.log(f"{loss_type}_wdl", loss_wdl)
+    teacher_prob = torch.sigmoid(batch_score / self.scale)
+    p_target = self.lambda_ * teacher_prob + (1.0 - self.lambda_) * batch_wdl
+    loss = F.binary_cross_entropy_with_logits(student_logits / self.scale, p_target)
 
-    return kd_loss
+    self.log(loss_type, loss)
+    return loss
 
   def training_step(self, batch, batch_idx):
     return self.step_(batch, batch_idx, 'train_loss')

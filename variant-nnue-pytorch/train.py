@@ -64,6 +64,8 @@ def main():
     nnue.set_feature_set(feature_set)
     nnue.lambda_ = args.lambda_
     nnue.scale = args.scale
+    nnue.l1_size = args.l1_size
+    nnue.l2_size = args.l2_size
     nnue.cuda()
 
   print("Feature set: {}".format(feature_set.name))
