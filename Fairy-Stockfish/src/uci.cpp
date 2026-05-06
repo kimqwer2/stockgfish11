@@ -18,6 +18,7 @@
 
 #include <cstdlib>
 #include <cassert>
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <iostream>
@@ -28,6 +29,7 @@
 
 #include "evaluate.h"
 #include "movegen.h"
+#include "nnue/nnue_architecture.h"
 #include "position.h"
 #include "search.h"
 #include "thread.h"
@@ -93,6 +95,40 @@ namespace {
     Eval::NNUE::verify();
 
     sync_cout << "\n" << Eval::trace(p) << sync_endl;
+  }
+
+  void debug_indices(const Position& pos) {
+
+    using Eval::NNUE::FeatureSet;
+    using Eval::NNUE::IndexType;
+
+    constexpr IndexType MaxActiveDimensions = FeatureSet::MaxActiveDimensions;
+    sync_cout << "info string debug-indices fen " << pos.fen() << sync_endl;
+    sync_cout << "info string debug-indices feature-dimensions " << FeatureSet::get_dimensions()
+              << " max-active " << MaxActiveDimensions << sync_endl;
+
+    for (Color perspective : { WHITE, BLACK })
+    {
+        ValueList<IndexType, MaxActiveDimensions> active;
+        FeatureSet::append_active_indices(pos, perspective, active);
+
+        sync_cout << "info string debug-indices " << (perspective == WHITE ? "white" : "black")
+                  << " count " << active.size() << sync_endl;
+
+        std::ostringstream raw;
+        raw << "info string debug-indices " << (perspective == WHITE ? "white" : "black") << " indices";
+        for (const auto idx : active)
+            raw << ' ' << idx;
+        sync_cout << raw.str() << sync_endl;
+
+        std::vector<IndexType> sorted(active.begin(), active.end());
+        std::sort(sorted.begin(), sorted.end());
+        std::ostringstream sortedOut;
+        sortedOut << "info string debug-indices " << (perspective == WHITE ? "white" : "black") << " sorted";
+        for (const auto idx : sorted)
+            sortedOut << ' ' << idx;
+        sync_cout << sortedOut.str() << sync_endl;
+    }
   }
 
 
@@ -717,6 +753,7 @@ void UCI::loop(int argc, char* argv[]) {
       else if (token == "bench")    bench(pos, is, states);
       else if (token == "d")        sync_cout << pos << sync_endl;
       else if (token == "eval")     trace_eval(pos);
+      else if (token == "debug-indices") debug_indices(pos);
       else if (token == "compiler") sync_cout << compiler_info() << sync_endl;
       else if (token == "eval-relabel") {
           string teacher, input, output;
