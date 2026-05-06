@@ -317,12 +317,10 @@ class NNUE(pl.LightningModule):
     batch_score = batch_score.view(-1)
     batch_wdl = batch_wdl.view(-1)
 
-    if batch_idx % 100 == 0:
-      print(f"SCORE_DEBUG: {batch_score[0].item()}")
 
     teacher_prob = torch.sigmoid(batch_score / self.scale)
     p_target = self.lambda_ * teacher_prob + (1.0 - self.lambda_) * batch_wdl
-    loss = F.binary_cross_entropy_with_logits(student_logits / self.scale, p_target)
+    loss = F.binary_cross_entropy_with_logits(student_logits, p_target)
 
     self.log(loss_type, loss)
     return loss
