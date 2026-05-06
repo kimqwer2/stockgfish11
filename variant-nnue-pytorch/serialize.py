@@ -218,6 +218,8 @@ def main():
   parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
   parser.add_argument("target", help="Target file (can be .pt or .nnue)")
   parser.add_argument("--description", default=None, type=str, dest='description', help="The description string to include in the network. Only works when serializing into a .nnue file.")
+  parser.add_argument("--l1-size", default=M.DEFAULT_L1, type=int, dest='l1_size', help="Hidden size of feature transformer output used when loading .ckpt checkpoints.")
+  parser.add_argument("--l2-size", default=M.DEFAULT_L2, type=int, dest='l2_size', help="Hidden size of first layer stack layer used when loading .ckpt checkpoints.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -226,7 +228,7 @@ def main():
   print('Converting %s to %s' % (args.source, args.target))
 
   if args.source.endswith('.ckpt'):
-    nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set)
+    nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set, l1_size=args.l1_size, l2_size=args.l2_size)
     nnue.eval()
   elif args.source.endswith('.pt'):
     # Load with weights_only=False to avoid safe_globals complexity
