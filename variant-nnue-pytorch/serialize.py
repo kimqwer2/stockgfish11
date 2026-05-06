@@ -23,6 +23,29 @@ def ascii_hist(name, x, bins=6):
     xi = '{0: <8.4g}'.format(xi).ljust(10)
     print('{0}| {1}'.format(xi,bar))
 
+def feature_set_for_checkpoint(source, requested_feature_set):
+  checkpoint = torch.load(source, map_location='cpu')
+  state_dict = checkpoint.get('state_dict', checkpoint)
+  input_weight = state_dict.get('input.weight')
+
+  if input_weight is None:
+    return requested_feature_set
+
+  checkpoint_features = input_weight.shape[0]
+  if checkpoint_features == requested_feature_set.num_features:
+    return requested_feature_set
+
+  if checkpoint_features == requested_feature_set.num_real_features:
+    real_feature_name = '+'.join(feature.get_main_factor_name() for feature in requested_feature_set.features)
+    real_feature_set = features.get_feature_set_from_name(real_feature_name)
+    if checkpoint_features == real_feature_set.num_features:
+      print('Checkpoint input has {} features; loading with real feature set {} instead of requested training feature set {}.'.format(
+        checkpoint_features, real_feature_set.name, requested_feature_set.name))
+      return real_feature_set
+
+  raise RuntimeError('Checkpoint input.weight has {} features, but requested feature set {} has {} training features and {} real features.'.format(
+    checkpoint_features, requested_feature_set.name, requested_feature_set.num_features, requested_feature_set.num_real_features))
+
 # hardcoded for now
 VERSION = 0x7AF32F20
 DEFAULT_DESCRIPTION = "Network trained with the https://github.com/ianfab/variant-nnue-pytorch trainer."
@@ -228,7 +251,8 @@ def main():
   print('Converting %s to %s' % (args.source, args.target))
 
   if args.source.endswith('.ckpt'):
-    nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set, l1_size=args.l1_size, l2_size=args.l2_size)
+    checkpoint_feature_set = feature_set_for_checkpoint(args.source, feature_set)
+    nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=checkpoint_feature_set, l1_size=args.l1_size, l2_size=args.l2_size)
     nnue.eval()
   elif args.source.endswith('.pt'):
     # Load with weights_only=False to avoid safe_globals complexity
