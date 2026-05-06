@@ -77,6 +77,11 @@ namespace Stockfish::Eval::NNUE {
   using TransformedFeatureType = std::uint8_t;
   using IndexType = std::uint32_t;
 
+  // Mini-engine NNUE architecture constants for the distilled Janggi student.
+  constexpr IndexType L1 = 256;
+  constexpr IndexType L2 = 32;
+  constexpr IndexType FeatureDimensions = 45056;
+
   // Round n up to be a multiple of base
   template <typename IntType>
   constexpr IntType ceil_to_multiple(IntType n, IntType base) {

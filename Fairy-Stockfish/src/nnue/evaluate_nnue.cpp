@@ -93,12 +93,27 @@ namespace Stockfish::Eval::NNUE {
   // Read network header
   bool read_header(std::istream& stream, std::uint32_t* hashValue, std::string* desc)
   {
-    std::uint32_t version, size;
+    std::uint32_t version, sizeOrL1, l2 = 0, size;
 
     version     = read_little_endian<std::uint32_t>(stream);
     *hashValue  = read_little_endian<std::uint32_t>(stream);
-    size        = read_little_endian<std::uint32_t>(stream);
+    sizeOrL1    = read_little_endian<std::uint32_t>(stream);
     if (!stream || version != Version) return false;
+
+    // New variant-nnue-pytorch serializers write the dynamic architecture sizes
+    // before the network description length. Accept that header and verify it
+    // matches this engine build, while still supporting legacy headers that go
+    // directly from hash to description length.
+    if (sizeOrL1 == TransformedFeatureDimensions)
+    {
+        l2 = read_little_endian<std::uint32_t>(stream);
+        if (!stream || l2 != Layers::HiddenLayer1::OutputDimensions) return false;
+        size = read_little_endian<std::uint32_t>(stream);
+    }
+    else
+        size = sizeOrL1;
+
+    if (!stream) return false;
     desc->resize(size);
     stream.read(&(*desc)[0], size);
     return !stream.fail();
@@ -109,6 +124,8 @@ namespace Stockfish::Eval::NNUE {
   {
     write_little_endian<std::uint32_t>(stream, Version);
     write_little_endian<std::uint32_t>(stream, hashValue);
+    write_little_endian<std::uint32_t>(stream, TransformedFeatureDimensions);
+    write_little_endian<std::uint32_t>(stream, Layers::HiddenLayer1::OutputDimensions);
     write_little_endian<std::uint32_t>(stream, desc.size());
     stream.write(&desc[0], desc.size());
     return !stream.fail();
