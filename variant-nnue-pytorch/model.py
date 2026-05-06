@@ -302,13 +302,16 @@ class NNUE(pl.LightningModule):
 
     us, them, white_indices, white_values, black_indices, black_values, outcome, score, psqt_indices, layer_stack_indices = batch
 
-    student_logits = self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices, debug_indices=(batch_idx == 0)).squeeze(-1)
-    teacher_prob = torch.sigmoid(score / self.scale)
-    p_target = self.lambda_ * teacher_prob + (1.0 - self.lambda_) * outcome
+    student_logits = self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices, debug_indices=(batch_idx == 0)).view(-1)
+    outcome = outcome.view(-1)
+    score = score.view(-1)
 
-    student_scaled_logits = student_logits / self.scale
+    teacher_prob = torch.sigmoid(score / self.scale)
+    p_target = (self.lambda_ * teacher_prob + (1.0 - self.lambda_) * outcome).view(-1)
+
+    student_scaled_logits = (student_logits / self.scale).view(-1)
     kd_loss = F.binary_cross_entropy_with_logits(student_scaled_logits, p_target)
-    loss_teacher_eval = F.binary_cross_entropy_with_logits(student_scaled_logits, teacher_prob)
+    loss_teacher_eval = F.binary_cross_entropy_with_logits(student_scaled_logits, teacher_prob.view(-1))
     loss_wdl = F.binary_cross_entropy_with_logits(student_scaled_logits, outcome)
 
     self.log(loss_type, kd_loss)
