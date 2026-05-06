@@ -6,8 +6,9 @@ Use this together with the engine-side `debug-indices` UCI command. Example:
     python3 debug_indices.py "rnba1abnr/4k4/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/4K4/RNBA1ABNR w - - 0 1"
 
 The script mirrors Fairy-Stockfish's HalfKAv2Variants feature layout for a
-9x10 Janggi board: variant square = rank * 9 + file, black perspective flips
-rank only, and king squares are bucketed through the 3x3 palace map.
+9x10 Janggi board: variant square = rank * 9 + file with the first
+FEN row as rank 0, black perspective flips rank only, and king squares are
+bucketed through the 3x3 palace map.
 """
 
 import argparse
@@ -18,17 +19,16 @@ import chess
 import halfka_v2
 import variant
 
-# Fairy-Stockfish Variant::conclude() assigns non-king piece planes by ascending
-# PieceType enum, excluding the NNUE king until the final plane. For Janggi this
-# maps FEN letters to the same 0-based piece indices expected by halfka_v2.py.
+# Fairy-Stockfish's Janggi HalfKAv2 active indices use this 0-based NNUE
+# piece-plane order. The king is merged into the final single king plane.
 PIECE_TO_TYPE = {
-    "n": 0,  # KNIGHT / horse
-    "r": 1,  # ROOK
-    "a": 2,  # WAZIR / advisor/guard
-    "c": 3,  # JANGGI_CANNON
-    "p": 4,  # SOLDIER
-    "b": 5,  # JANGGI_ELEPHANT
-    "k": 6,  # KING, merged to the final single king plane by HalfKAv2
+    "r": 0,  # ROOK
+    "c": 1,  # JANGGI_CANNON
+    "p": 2,  # SOLDIER
+    "n": 3,  # KNIGHT / horse
+    "b": 4,  # JANGGI_ELEPHANT
+    "a": 5,  # WAZIR / advisor/guard
+    "k": 6,  # KING
 }
 
 
@@ -50,7 +50,9 @@ def parse_janggi_fen(fen: str):
     kings = {chess.WHITE: None, chess.BLACK: None}
 
     for row_idx, row in enumerate(rows):
-        rank = variant.RANKS - 1 - row_idx
+        # Fairy-Stockfish's variant-square compression maps the first Janggi FEN
+        # row to variant rank 0, not to the highest rank as python-chess does.
+        rank = row_idx
         file_idx = 0
         i = 0
         while i < len(row):
@@ -71,7 +73,10 @@ def parse_janggi_fen(fen: str):
                 raise ValueError(f"too many files in row '{row}'")
 
             sq = rank * variant.FILES + file_idx
-            color = chess.WHITE if ch.isupper() else chess.BLACK
+            # Match the engine's debug-indices output for janggimodern: lowercase
+            # startpos pieces are Color::WHITE/own for the first perspective,
+            # uppercase pieces are Color::BLACK/opponent.
+            color = chess.WHITE if ch.islower() else chess.BLACK
             piece_type = PIECE_TO_TYPE[key]
             pieces.append(Piece(sq, piece_type, color, ch))
             if key == "k":
