@@ -23,6 +23,29 @@ def ascii_hist(name, x, bins=6):
     xi = '{0: <8.4g}'.format(xi).ljust(10)
     print('{0}| {1}'.format(xi,bar))
 
+def feature_set_for_checkpoint(source, requested_feature_set):
+  checkpoint = torch.load(source, map_location='cpu')
+  state_dict = checkpoint.get('state_dict', checkpoint)
+  input_weight = state_dict.get('input.weight')
+
+  if input_weight is None:
+    return requested_feature_set
+
+  checkpoint_features = input_weight.shape[0]
+  if checkpoint_features == requested_feature_set.num_features:
+    return requested_feature_set
+
+  if checkpoint_features == requested_feature_set.num_real_features:
+    real_feature_name = '+'.join(feature.get_main_factor_name() for feature in requested_feature_set.features)
+    real_feature_set = features.get_feature_set_from_name(real_feature_name)
+    if checkpoint_features == real_feature_set.num_features:
+      print('Checkpoint input has {} features; loading with real feature set {} instead of requested training feature set {}.'.format(
+        checkpoint_features, real_feature_set.name, requested_feature_set.name))
+      return real_feature_set
+
+  raise RuntimeError('Checkpoint input.weight has {} features, but requested feature set {} has {} training features and {} real features.'.format(
+    checkpoint_features, requested_feature_set.name, requested_feature_set.num_features, requested_feature_set.num_real_features))
+
 # hardcoded for now
 VERSION = 0x7AF32F20
 DEFAULT_DESCRIPTION = "Network trained with the https://github.com/ianfab/variant-nnue-pytorch trainer."
@@ -39,7 +62,7 @@ class NNUEWriter():
 
     fc_hash = self.fc_hash(model)
     self.write_header(model, fc_hash, description)
-    self.int32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    self.int32(model.feature_set.hash ^ (model.l1_size*2)) # Feature transformer hash
     self.write_feature_transformer(model)
     for l1, l2, output in model.layer_stacks.get_coalesced_layer_stacks():
       self.int32(fc_hash) # FC layers hash
@@ -51,7 +74,7 @@ class NNUEWriter():
   def fc_hash(model):
     # InputSlice hash
     prev_hash = 0xEC42E90D
-    prev_hash ^= (M.L1 * 2)
+    prev_hash ^= (model.l1_size * 2)
 
     # Fully connected layers
     layers = [model.layer_stacks.l1, model.layer_stacks.l2, model.layer_stacks.output]
@@ -68,7 +91,9 @@ class NNUEWriter():
 
   def write_header(self, model, fc_hash, description):
     self.int32(VERSION) # version
-    self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    self.int32(fc_hash ^ model.feature_set.hash ^ (model.l1_size*2)) # halfkp network hash
+    self.int32(model.l1_size)
+    self.int32(model.l2_size)
     encoded_description = description.encode('utf-8')
     self.int32(len(encoded_description)) # Network definition
     self.buf.extend(encoded_description)
@@ -77,14 +102,14 @@ class NNUEWriter():
     # int16 bias = round(x * 127)
     # int16 weight = round(x * 127)
     layer = model.input
-    bias = layer.bias.data[:M.L1]
+    bias = layer.bias.data[:model.l1_size]
     bias = bias.mul(127).round().to(torch.int16)
     ascii_hist('ft bias:', bias.numpy())
     self.buf.extend(bias.flatten().numpy().tobytes())
 
     weight = M.coalesce_ft_weights(model, layer)
-    weight0 = weight[:, :M.L1]
-    psqtweight0 = weight[:, M.L1:]
+    weight0 = weight[:, :model.l1_size]
+    psqtweight0 = weight[:, model.l1_size:]
     weight = weight0.mul(127).round().to(torch.int16)
     psqtweight = psqtweight0.mul(9600).round().to(torch.int32) # kPonanzaConstant * FV_SCALE = 9600
     ascii_hist('ft weight:', weight.numpy())
@@ -133,32 +158,40 @@ class NNUEReader():
   def __init__(self, f, feature_set):
     self.f = f
     self.feature_set = feature_set
-    self.model = M.NNUE(feature_set)
+    self.model = None
+    l1_size, l2_size = self.read_header(feature_set)
+    self.model = M.NNUE(feature_set, l1_size=l1_size, l2_size=l2_size)
     fc_hash = NNUEWriter.fc_hash(self.model)
-
-    self.read_header(feature_set, fc_hash)
-    self.read_int32(feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    self.read_int32(feature_set.hash ^ (self.model.l1_size*2)) # Feature transformer hash
     self.read_feature_transformer(self.model.input, self.model.num_psqt_buckets)
     for i in range(self.model.num_ls_buckets):
-      l1 = nn.Linear(2*M.L1, M.L2)
-      l2 = nn.Linear(M.L2, M.L3)
+      l1 = nn.Linear(2*self.model.l1_size, self.model.l2_size)
+      l2 = nn.Linear(self.model.l2_size, M.L3)
       output = nn.Linear(M.L3, 1)
       self.read_int32(fc_hash) # FC layers hash
       self.read_fc_layer(l1)
       self.read_fc_layer(l2)
       self.read_fc_layer(output, is_output=True)
-      self.model.layer_stacks.l1.weight.data[i*M.L2:(i+1)*M.L2, :] = l1.weight
-      self.model.layer_stacks.l1.bias.data[i*M.L2:(i+1)*M.L2] = l1.bias
+      self.model.layer_stacks.l1.weight.data[i*self.model.l2_size:(i+1)*self.model.l2_size, :] = l1.weight
+      self.model.layer_stacks.l1.bias.data[i*self.model.l2_size:(i+1)*self.model.l2_size] = l1.bias
       self.model.layer_stacks.l2.weight.data[i*M.L3:(i+1)*M.L3, :] = l2.weight
       self.model.layer_stacks.l2.bias.data[i*M.L3:(i+1)*M.L3] = l2.bias
       self.model.layer_stacks.output.weight.data[i:(i+1), :] = output.weight
       self.model.layer_stacks.output.bias.data[i:(i+1)] = output.bias
 
-  def read_header(self, feature_set, fc_hash):
+  def read_header(self, feature_set):
     self.read_int32(VERSION) # version
-    self.read_int32(fc_hash ^ feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    net_hash = self.read_int32()
+    l1_size = self.read_int32()
+    l2_size = self.read_int32()
+    temp_model = M.NNUE(feature_set, l1_size=l1_size, l2_size=l2_size)
+    fc_hash = NNUEWriter.fc_hash(temp_model)
+    expected = fc_hash ^ feature_set.hash ^ (l1_size * 2)
+    if net_hash != expected:
+      raise Exception("Expected: %x, got %x" % (expected, net_hash))
     desc_len = self.read_int32() # Network definition
     description = self.f.read(desc_len)
+    return l1_size, l2_size
 
   def tensor(self, dtype, shape):
     d = numpy.fromfile(self.f, dtype, reduce(operator.mul, shape, 1))
@@ -208,6 +241,8 @@ def main():
   parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
   parser.add_argument("target", help="Target file (can be .pt or .nnue)")
   parser.add_argument("--description", default=None, type=str, dest='description', help="The description string to include in the network. Only works when serializing into a .nnue file.")
+  parser.add_argument("--l1-size", default=M.DEFAULT_L1, type=int, dest='l1_size', help="Hidden size of feature transformer output used when loading .ckpt checkpoints.")
+  parser.add_argument("--l2-size", default=M.DEFAULT_L2, type=int, dest='l2_size', help="Hidden size of first layer stack layer used when loading .ckpt checkpoints.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -216,7 +251,8 @@ def main():
   print('Converting %s to %s' % (args.source, args.target))
 
   if args.source.endswith('.ckpt'):
-    nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set)
+    checkpoint_feature_set = feature_set_for_checkpoint(args.source, feature_set)
+    nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=checkpoint_feature_set, l1_size=args.l1_size, l2_size=args.l2_size)
     nnue.eval()
   elif args.source.endswith('.pt'):
     # Load with weights_only=False to avoid safe_globals complexity

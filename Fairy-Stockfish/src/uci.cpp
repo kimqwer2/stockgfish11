@@ -18,8 +18,11 @@
 
 #include <cstdlib>
 #include <cassert>
+#include <cstdint>
 #include <cmath>
 #include <iostream>
+#include <fstream>
+#include <vector>
 #include <sstream>
 #include <string>
 
@@ -90,6 +93,331 @@ namespace {
     Eval::NNUE::verify();
 
     sync_cout << "\n" << Eval::trace(p) << sync_endl;
+  }
+
+
+  namespace {
+    constexpr size_t PackedSfenDataBits = 512;
+
+    struct PackedSfen { std::uint8_t data[PackedSfenDataBits / 8]; };
+
+    struct PackedSfenValue {
+      PackedSfen sfen;
+      std::int16_t score;
+      std::uint16_t move;
+      std::uint16_t gamePly;
+      std::int8_t game_result;
+      std::uint8_t padding;
+    };
+
+    static_assert(sizeof(PackedSfenValue) == PackedSfenDataBits / 8 + 8,
+                  "Unexpected packed sfen value size");
+
+    struct BitStream {
+      void set_data(std::uint8_t* data_) { data = data_; bit_cursor = 0; }
+
+      int read_one_bit() {
+        int b = (data[bit_cursor / 8] >> (bit_cursor & 7)) & 1;
+        ++bit_cursor;
+        return b;
+      }
+
+      int read_n_bit(int n) {
+        int result = 0;
+        for (int i = 0; i < n; ++i)
+            result |= read_one_bit() ? (1 << i) : 0;
+        return result;
+      }
+
+      int get_cursor() const { return bit_cursor; }
+
+      int bit_cursor = 0;
+      std::uint8_t* data = nullptr;
+    };
+
+    struct HuffmanedPiece {
+      int code;
+      int bits;
+    };
+
+    constexpr HuffmanedPiece huffman_table[] = {
+      {0b00000,1}, {0b00001,5}, {0b00011,5}, {0b00101,5}, {0b00111,5},
+      {0b01001,5}, {0b01011,5}, {0b01101,5}, {0b01111,5}, {0b10001,5},
+      {0b10011,5}, {0b10101,5}, {0b10111,5}, {0b11001,5}, {0b11011,5},
+      {0b11101,5}, {0b11111,5},
+    };
+
+    Square from_variant_square(Square s, const Variant* variant) {
+      return Square(s + s / (variant->maxFile + 1) * (FILE_MAX - variant->maxFile));
+    }
+
+    std::string square_to_fen(Square s) {
+      return std::string{char('a' + file_of(s)), char('1' + rank_of(s))};
+    }
+
+    PieceType piece_type_from_packed_index(const Variant* variant, int packedIndex) {
+      int i = 0;
+      PieceSet ps = variant->pieceTypes;
+
+      while (ps)
+      {
+          PieceSet candidates = ps != piece_set(variant->nnueKing) ? ps & ~piece_set(variant->nnueKing) : ps;
+          PieceType pt = lsb(candidates);
+          ps ^= pt;
+
+          if (++i == packedIndex)
+              return pt;
+      }
+
+      return NO_PIECE_TYPE;
+    }
+
+    Piece read_board_piece_from_stream(BitStream& stream, const Variant* variant) {
+      int packedIndex = 0;
+      int code = 0, bits = 0;
+
+      while (true)
+      {
+          code |= stream.read_one_bit() << bits;
+          ++bits;
+
+          if (bits > 6)
+              return NO_PIECE;
+
+          for (packedIndex = 0; packedIndex <= 16; ++packedIndex)
+              if (huffman_table[packedIndex].code == code && huffman_table[packedIndex].bits == bits)
+                  goto Found;
+      }
+
+    Found:
+      if (packedIndex == 0)
+          return NO_PIECE;
+
+      Color c = Color(stream.read_one_bit());
+      PieceType pt = piece_type_from_packed_index(variant, packedIndex);
+      return pt == NO_PIECE_TYPE ? NO_PIECE : make_piece(c, pt);
+    }
+
+    bool decode_packed_sfen_to_fen(const PackedSfen& sfen, const Variant* variant, std::string& fen) {
+      BitStream stream;
+      stream.set_data(const_cast<std::uint8_t*>(reinterpret_cast<const std::uint8_t*>(&sfen)));
+
+      Piece board[SQUARE_NB] = {};
+
+      Color sideToMove = Color(stream.read_one_bit());
+
+      for (Color c : { WHITE, BLACK })
+      {
+          Square ksq = from_variant_square(Square(stream.read_n_bit(7)), variant);
+          if (variant->nnueKing != NO_PIECE_TYPE && is_ok(ksq))
+              board[ksq] = make_piece(c, variant->nnueKing);
+      }
+
+      for (Rank r = variant->maxRank; r >= RANK_1; --r)
+          for (File f = FILE_A; f <= variant->maxFile; ++f)
+          {
+              Square sq = make_square(f, r);
+              if (board[sq] == NO_PIECE)
+              {
+                  Piece pc = read_board_piece_from_stream(stream, variant);
+                  if (pc != NO_PIECE)
+                      board[sq] = pc;
+              }
+
+              if (stream.get_cursor() > int(PackedSfenDataBits))
+                  return false;
+          }
+
+      int handCount[COLOR_NB][PIECE_TYPE_NB] = {};
+      for (Color c : { WHITE, BLACK })
+      {
+          PieceSet ps = variant->pieceTypes;
+          while (ps)
+          {
+              PieceType pt = pop_lsb(ps);
+              handCount[c][pt] = stream.read_n_bit(PackedSfenDataBits > 512 ? 7 : 5);
+          }
+      }
+
+      std::string castling;
+      if (stream.read_one_bit()) castling += 'K';
+      if (stream.read_one_bit()) castling += 'Q';
+      if (stream.read_one_bit()) castling += 'k';
+      if (stream.read_one_bit()) castling += 'q';
+      if (castling.empty()) castling = "-";
+
+      std::string ep = "-";
+      if (stream.read_one_bit())
+      {
+          Square epSquare = from_variant_square(Square(stream.read_n_bit(7)), variant);
+          if (is_ok(epSquare))
+              ep = square_to_fen(epSquare);
+      }
+
+      int rule50 = stream.read_n_bit(6);
+      int fullmove = stream.read_n_bit(8);
+      fullmove |= stream.read_n_bit(8) << 8;
+      rule50 |= stream.read_n_bit(1) << 6;
+      fullmove = std::max(fullmove, 1);
+
+      std::ostringstream fenBuilder;
+      for (Rank r = variant->maxRank; r >= RANK_1; --r)
+      {
+          int empty = 0;
+          for (File f = FILE_A; f <= variant->maxFile; ++f)
+          {
+              Piece pc = board[make_square(f, r)];
+              if (pc == NO_PIECE)
+              {
+                  ++empty;
+                  continue;
+              }
+
+              if (empty)
+              {
+                  fenBuilder << empty;
+                  empty = 0;
+              }
+
+              char pieceChar = variant->pieceToChar[pc];
+              if (pieceChar == ' ')
+                  return false;
+              fenBuilder << pieceChar;
+          }
+
+          if (empty)
+              fenBuilder << empty;
+          if (r != RANK_1)
+              fenBuilder << '/';
+      }
+
+      std::string hand;
+      for (Color c : { WHITE, BLACK })
+      {
+          PieceSet ps = variant->pieceTypes;
+          while (ps)
+          {
+              PieceType pt = pop_lsb(ps);
+              char pieceChar = variant->pieceToChar[make_piece(c, pt)];
+              if (pieceChar == ' ')
+                  continue;
+              hand.append(handCount[c][pt], pieceChar);
+          }
+      }
+      if (!hand.empty())
+          fenBuilder << '[' << hand << ']';
+
+      fenBuilder << ' ' << (sideToMove == WHITE ? 'w' : 'b')
+                 << ' ' << castling
+                 << ' ' << ep
+                 << ' ' << rule50
+                 << ' ' << fullmove;
+
+      fen = fenBuilder.str();
+      return stream.get_cursor() <= int(PackedSfenDataBits);
+    }
+  }
+
+  void eval_relabel(Position& pos, StateListPtr& states, const string& teacher, const string& input, const string& output) {
+
+    Options["UCI_Variant"] = std::string("janggimodern");
+    Options["EvalFile"] = teacher;
+
+    states = StateListPtr(new std::deque<StateInfo>(1));
+    const Variant* variant = variants.find(Options["UCI_Variant"])->second;
+    pos.set(variant, variant->startFen, Options["UCI_Chess960"], &states->back(), Threads.main(), false);
+
+    Eval::NNUE::init();
+    Eval::NNUE::verify();
+
+    ifstream fin(input, ios::binary);
+    ofstream fout(output, ios::binary);
+
+    if (!fin || !fout) {
+      sync_cout << "info string eval-relabel: failed to open input or output file" << sync_endl;
+      return;
+    }
+
+    constexpr size_t BATCH = 1 << 14;
+    vector<PackedSfenValue> batch(BATCH);
+    uint64_t total = 0;
+
+    while (fin) {
+      fin.read(reinterpret_cast<char*>(batch.data()), static_cast<std::streamsize>(sizeof(PackedSfenValue) * batch.size()));
+      size_t got = static_cast<size_t>(fin.gcount()) / sizeof(PackedSfenValue);
+      if (!got)
+        break;
+
+      for (size_t i = 0; i < got; ++i) {
+        std::string fen;
+        if (!decode_packed_sfen_to_fen(batch[i].sfen, variant, fen)) {
+          sync_cout << "info string eval-relabel: failed to decode entry " << (total + i) << sync_endl;
+          continue;
+        }
+
+        StateInfo st;
+        Position p;
+        p.set(variant, fen, Options["UCI_Chess960"], &st, Threads.main(), false);
+        batch[i].score = static_cast<int16_t>(Eval::evaluate(p));
+      }
+
+      fout.write(reinterpret_cast<const char*>(batch.data()), static_cast<std::streamsize>(sizeof(PackedSfenValue) * got));
+      total += got;
+      if ((total & ((1ULL << 20) - 1)) == 0)
+        sync_cout << "info string eval-relabel processed " << total << " entries" << sync_endl;
+    }
+
+    sync_cout << "info string eval-relabel done " << total << " entries" << sync_endl;
+  }
+
+  void binpack_debug(Position& pos, StateListPtr& states, const string& input) {
+
+    Options["UCI_Variant"] = std::string("janggimodern");
+
+    states = StateListPtr(new std::deque<StateInfo>(1));
+    const Variant* variant = variants.find(Options["UCI_Variant"])->second;
+    pos.set(variant, variant->startFen, Options["UCI_Chess960"], &states->back(), Threads.main(), false);
+
+    ifstream fin(input, ios::binary);
+    if (!fin) {
+      sync_cout << "info string binpack-debug: failed to open input file " << input << sync_endl;
+      return;
+    }
+
+    sync_cout << "info string binpack-debug variant janggimodern file " << input << sync_endl;
+
+    for (size_t i = 0; i < 10; ++i) {
+      PackedSfenValue entry;
+      if (!fin.read(reinterpret_cast<char*>(&entry), static_cast<std::streamsize>(sizeof(PackedSfenValue)))) {
+        sync_cout << "info string binpack-debug: reached EOF after " << i << " entries" << sync_endl;
+        break;
+      }
+
+      std::string decodedFen;
+      if (!decode_packed_sfen_to_fen(entry.sfen, variant, decodedFen)) {
+        sync_cout << "info string binpack-debug entry " << i
+                  << " decode=failed"
+                  << " score " << entry.score
+                  << " wdl " << int(entry.game_result)
+                  << " gamePly " << entry.gamePly
+                  << sync_endl;
+        continue;
+      }
+
+      StateInfo st;
+      Position p;
+      p.set(variant, decodedFen, Options["UCI_Chess960"], &st, Threads.main(), false);
+
+      sync_cout << "info string binpack-debug entry " << i
+                << " score " << entry.score
+                << " wdl " << int(entry.game_result)
+                << " gamePly " << entry.gamePly
+                << " decoded_fen " << decodedFen
+                << " position_fen " << p.fen()
+                << sync_endl;
+    }
+
+    sync_cout << "info string binpack-debug done" << sync_endl;
   }
 
 
@@ -390,6 +718,20 @@ void UCI::loop(int argc, char* argv[]) {
       else if (token == "d")        sync_cout << pos << sync_endl;
       else if (token == "eval")     trace_eval(pos);
       else if (token == "compiler") sync_cout << compiler_info() << sync_endl;
+      else if (token == "eval-relabel") {
+          string teacher, input, output;
+          if (!(is >> teacher >> input >> output))
+              sync_cout << "info string usage: eval-relabel <teacher.nnue> <input.binpack> <output.binpack>" << sync_endl;
+          else
+              eval_relabel(pos, states, teacher, input, output);
+      }
+      else if (token == "binpack-debug") {
+          string input;
+          if (!(is >> input))
+              sync_cout << "info string usage: binpack-debug <input.binpack>" << sync_endl;
+          else
+              binpack_debug(pos, states, input);
+      }
       else if (token == "export_net")
       {
           std::optional<std::string> filename;
