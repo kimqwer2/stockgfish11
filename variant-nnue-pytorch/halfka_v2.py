@@ -15,17 +15,21 @@ NUM_PLANES_VIRTUAL = NUM_SQ * NUM_PT_VIRTUAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * 
 NUM_INPUTS = NUM_PLANES_REAL * NUM_KSQ
 
 def orient(is_white_pov: bool, sq: int):
+  # Fairy-Stockfish HalfKAv2Variants::orient() keeps files unchanged and flips
+  # ranks for the black perspective, then uses rank * FILES + file indexing.
   return sq % variant.FILES + (variant.RANKS - 1 - (sq // variant.FILES)) * variant.FILES if not is_white_pov else sq
 
 def halfka_idx(is_white_pov: bool, king_sq: int, sq: int, piece_type: int, color: bool):
-  p_idx = (piece_type - 1) * 2 + (color != is_white_pov)
+  # piece_type is the 0-based packed/Fairy NNUE piece index. For Janggi this is:
+  # horse, rook, advisor, cannon, soldier, elephant, king.
+  p_idx = piece_type * 2 + (color != is_white_pov)
   if NUM_PT_REAL % 2 and p_idx == NUM_PT_REAL:
     # merge kings into one plane
     p_idx -= 1
   return orient(is_white_pov, sq) + p_idx * NUM_SQ + king_sq * NUM_PLANES_REAL
 
 def halfka_hand_idx(is_white_pov: bool, king_sq: int, handCount: int, piece_type: int, color: bool):
-  p_idx = (piece_type - 1) * 2 + (color != is_white_pov)
+  p_idx = piece_type * 2 + (color != is_white_pov)
   return handCount + p_idx * variant.POCKETS + NUM_SQ * NUM_PT_REAL + king_sq * NUM_PLANES_REAL
 
 def map_king(sq: int):
@@ -65,7 +69,7 @@ class Features(FeatureBlock):
     def piece_features(turn):
       indices = torch.zeros(NUM_PLANES_REAL * NUM_KSQ)
       for sq, p in board.piece_map().items():
-        indices[halfka_idx(turn, orient(turn, board.king(turn)), sq, p)] = 1.0
+        indices[halfka_idx(turn, orient(turn, board.king(turn)), sq, orient(turn, sq), p.piece_type - 1, p.color)] = 1.0
       return indices
     return (piece_features(chess.WHITE), piece_features(chess.BLACK))
 

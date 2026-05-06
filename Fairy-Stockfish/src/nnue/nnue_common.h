@@ -80,7 +80,7 @@ namespace Stockfish::Eval::NNUE {
   // Mini-engine NNUE architecture constants for the distilled Janggi student.
   constexpr IndexType L1 = 256;
   constexpr IndexType L2 = 32;
-  constexpr IndexType FeatureDimensions = 45056;
+  constexpr IndexType FeatureDimensions = 10530;
 
   // Round n up to be a multiple of base
   template <typename IntType>
