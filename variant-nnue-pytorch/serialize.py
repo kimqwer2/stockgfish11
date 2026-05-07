@@ -168,18 +168,17 @@ class NNUEReader():
     self.read_int32(VERSION)
     net_hash = self.read_int32(label='network hash')
 
-    if forced_l1 is not None and forced_l2 is not None:
-      print(f"NNUEReader: forcing dimensions from CLI: l1={forced_l1}, l2={forced_l2}")
-      return forced_l1, forced_l2, 'forced'
-
     l1_candidate = self.read_int32(label='l1 candidate')
     l2_candidate = self.read_int32(label='l2 candidate')
-
     trainer_like = (16 <= l1_candidate <= 65536) and (1 <= l2_candidate <= 4096)
+
     if trainer_like:
       desc_len = self.read_int32(label='description length')
       if 0 <= desc_len <= 10_000_000:
         _ = self.f.read(desc_len)
+        if forced_l1 is not None and forced_l2 is not None:
+          print(f"NNUEReader: forcing dimensions from CLI: l1={forced_l1}, l2={forced_l2}")
+          return forced_l1, forced_l2, 'forced'
         temp_model = M.NNUE(feature_set, l1_size=l1_candidate, l2_size=l2_candidate)
         fc_hash = NNUEWriter.fc_hash(temp_model)
         expected = fc_hash ^ feature_set.hash ^ (l1_candidate * 2)
@@ -187,8 +186,12 @@ class NNUEReader():
           print(f"NNUEReader: warning header hash mismatch (expected {expected:08x}, got {net_hash:08x}); continuing in trainer mode.")
         return l1_candidate, l2_candidate, 'trainer'
 
+    # Fallback: legacy/original C++ format where feature-transformer hash starts right after net hash.
     self.f.seek(start + 8)
     print('NNUEReader: legacy/original C++ header detected (no explicit l1/l2 header fields).')
+    if forced_l1 is not None and forced_l2 is not None:
+      print(f"NNUEReader: forcing dimensions from CLI: l1={forced_l1}, l2={forced_l2}")
+      return forced_l1, forced_l2, 'forced'
     return M.DEFAULT_L1, M.DEFAULT_L2, 'legacy'
 
   def tensor(self, dtype, shape, label='tensor'):
