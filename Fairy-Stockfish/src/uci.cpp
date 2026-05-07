@@ -133,7 +133,7 @@ namespace {
 
 
   namespace {
-    constexpr size_t PackedSfenDataBits = 512;
+    constexpr size_t PackedSfenDataBits = 256;
 
     struct PackedSfen { std::uint8_t data[PackedSfenDataBits / 8]; };
 
@@ -141,9 +141,9 @@ namespace {
       PackedSfen sfen;
       std::int16_t score;
       std::uint16_t move;
-      std::uint16_t gamePly;
+      std::int8_t gamePly;
       std::int8_t game_result;
-      std::uint8_t padding;
+      std::uint16_t padding;
     };
 
     static_assert(sizeof(PackedSfenValue) == PackedSfenDataBits / 8 + 8,

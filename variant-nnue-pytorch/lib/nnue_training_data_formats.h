@@ -506,8 +506,8 @@ namespace bin
             // Used when finding the match rate with the teacher
             StockfishMove move;
 
-            // Trouble of the phase from the initial phase.
-            uint16_t gamePly;
+            // Ply index from the start position (stored as signed 8-bit in binpack format).
+            int8_t gamePly;
 
             // 1 if the player on this side ultimately wins the game. -1 if you are losing.
             // 0 if a draw is reached.
@@ -516,10 +516,10 @@ namespace bin
             int8_t game_result;
 
             // When exchanging the file that wrote the teacher aspect with other people
-            //Because this structure size is not fixed, pad it so that it is 40 bytes in any environment.
-            uint8_t padding;
+            // Keep explicit padding so layout stays: 32 + 2 + 2 + 1 + 1 + 2 = 40 bytes.
+            uint16_t padding;
 
-            // 32 + 2 + 2 + 2 + 1 + 1 = 40bytes
+            // 32 + 2 + 2 + 1 + 1 + 2 = 40 bytes
         };
         static_assert(sizeof(PackedSfenValue) == DATA_SIZE / 8 + 8);
         // Class that handles bitstream

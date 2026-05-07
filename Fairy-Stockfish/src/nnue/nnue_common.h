@@ -78,7 +78,7 @@ namespace Stockfish::Eval::NNUE {
   using IndexType = std::uint32_t;
 
   // Mini-engine NNUE architecture constants for the distilled Janggi student.
-  constexpr IndexType L1 = 256;
+  constexpr IndexType L1 = 1024;
   constexpr IndexType L2 = 32;
   constexpr IndexType FeatureDimensions = 10530;
 
