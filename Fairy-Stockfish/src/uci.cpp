@@ -133,7 +133,7 @@ namespace {
 
 
   namespace {
-    constexpr size_t PackedSfenDataBits = 512;
+    constexpr size_t PackedSfenDataBits = 256;
 
     struct PackedSfen { std::uint8_t data[PackedSfenDataBits / 8]; };
 
