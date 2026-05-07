@@ -267,13 +267,18 @@ class NNUE(pl.LightningModule):
     in_scaling = 410
     out_scaling = 361
 
-    q = (self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices) * nnue2score / out_scaling).sigmoid()
-    t = outcome
-    p = (score / in_scaling).sigmoid()
+    student_prob = (self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices) * nnue2score / out_scaling).sigmoid()
+    game_result = outcome
+    teacher_prob = (score / in_scaling).sigmoid()
 
-    loss_eval = (p - q).square().mean()
-    loss_result = (q - t).square().mean()
-    loss = self.lambda_ * loss_eval + (1.0 - self.lambda_) * loss_result
+    # Knowledge Distillation target:
+    # lambda_=1.0 -> pure teacher supervision from relabeled score
+    # lambda_=0.0 -> pure game-result supervision from outcome
+    p_target = self.lambda_ * teacher_prob + (1.0 - self.lambda_) * game_result
+
+    # Keep the original trainer's MSE-on-probabilities style objective while
+    # explicitly exposing the KD blend target used by binpack score relabeling.
+    loss = (student_prob - p_target).square().mean()
 
     self.log(loss_type, loss)
 
