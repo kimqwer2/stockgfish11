@@ -1,0 +1,43 @@
+# Ignore binaries in src/ that have no extension
+/src/*
+!/src/*.*
+!/src/*/
+
+# Files from build
+**/*.o
+**/*.s
+src/.depend
+
+# Built binary
+src/stockfish*
+src/-lstdc++.res
+
+# Neural network for the NNUE evaluation
+**/*.nnue
+
+
+# Build/test artifacts
+*.exe
+tests/syzygy
+
+# ffishjs
+tests/js/node_modules
+ffish.js
+*.wasm
+
+# pyffish
+venv
+*.so
+pyffish.egg-info
+__pycache__
+*.pyc
+
+# test artifacts
+tests/*.exp
+src/*.log
+src/*.epd
+src/*.txt
+
+# IDEs
+.vscode
+.idea
