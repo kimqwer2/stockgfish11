@@ -137,21 +137,24 @@ class NNUEWriter():
 
 
 class NNUEReader():
-  def __init__(self, f, feature_set, forced_l1=None, forced_l2=None):
+  def __init__(self, f, feature_set, forced_l1=None, forced_l2=None, legacy_ft_only=False):
     self.f = f
     self.feature_set = feature_set
     self.model = None
+    self.legacy_ft_only = legacy_ft_only
 
     l1_size, l2_size, header_kind = self.read_header(feature_set, forced_l1=forced_l1, forced_l2=forced_l2)
-    print(f"NNUEReader: using header mode={header_kind}, l1={l1_size}, l2={l2_size}")
+    print(f"NNUEReader: using header mode={header_kind}, l1={l1_size}, l2={l2_size}, legacy_ft_only={legacy_ft_only}")
     self.model = M.NNUE(feature_set, l1_size=l1_size, l2_size=l2_size)
+
+    if self.legacy_ft_only:
+      self.read_int32(label='feature transformer hash (legacy/ignored)')
+      self.read_feature_transformer_legacy_int8(self.model.input, self.model.num_psqt_buckets)
+      print('NNUEReader: legacy FT extraction complete; FC layers left at model initialization defaults.')
+      return
+
     fc_hash = NNUEWriter.fc_hash(self.model)
-
-    if header_kind == 'trainer':
-      self.read_int32(feature_set.hash ^ (self.model.l1_size * 2), strict=False, label='feature transformer hash')
-    else:
-      self.read_int32(label='feature transformer hash (legacy)')
-
+    self.read_int32(feature_set.hash ^ (self.model.l1_size * 2), strict=False, label='feature transformer hash')
     self.read_feature_transformer(self.model.input, self.model.num_psqt_buckets)
 
     for i in range(self.model.num_ls_buckets):
@@ -192,7 +195,6 @@ class NNUEReader():
           print(f"NNUEReader: warning header hash mismatch (expected {expected:08x}, got {net_hash:08x}); continuing in trainer mode.")
         return l1_candidate, l2_candidate, 'trainer'
 
-    # Fallback: legacy/original C++ format where feature-transformer hash starts right after net hash.
     self.f.seek(start + 8)
     print('NNUEReader: legacy/original C++ header detected (no explicit l1/l2 header fields).')
     if forced_l1 is not None and forced_l2 is not None:
@@ -200,61 +202,60 @@ class NNUEReader():
       return forced_l1, forced_l2, 'forced'
     return M.DEFAULT_L1, M.DEFAULT_L2, 'legacy'
 
-  def tensor(self, dtype, shape, label='tensor'):
+  def tensor(self, dtype, shape, label='tensor', allow_eof=False):
     expected = reduce(operator.mul, shape, 1)
     d = numpy.fromfile(self.f, dtype, expected)
     got = d.size
     if got != expected:
       bytes_per_elem = numpy.dtype(dtype).itemsize
       print(f"ERROR while reading {label}: got {got} elements, expected {expected} ({expected * bytes_per_elem} bytes).")
-      remaining_bytes = 0
-      try:
-        cur = self.f.tell()
-        self.f.seek(0, 2)
-        end = self.f.tell()
-        self.f.seek(cur)
-        remaining_bytes = end - cur
-      except Exception:
-        pass
-      if remaining_bytes > 0:
-        hint = remaining_bytes // max(1, (self.feature_set.num_features * 2))
-        print(f"Hint: remaining bytes={remaining_bytes}, rough L1 hint (int16 FT weights only)≈{hint}.")
+      if allow_eof:
+        return None
       raise RuntimeError(f"Short read for {label}")
-
     try:
-      d = torch.from_numpy(d.astype(numpy.float32)).reshape(shape)
-    except RuntimeError as e:
+      return torch.from_numpy(d.astype(numpy.float32)).reshape(shape)
+    except RuntimeError:
       print(f"Reshape error for {label}: got elements={got}, expected shape={shape} ({expected} elements)")
-      if len(shape) >= 2:
-        rows = shape[0]
-        approx_l1 = got // max(rows, 1)
-        print(f"Hint: inferred second dimension from element count is approximately {approx_l1}.")
       raise
-    return d
 
   def read_feature_transformer(self, layer, num_psqt_buckets):
     ft_out = layer.bias.shape[0] - num_psqt_buckets
     input_dims = layer.weight.shape[0]
-
     bias = self.tensor(numpy.int16, [ft_out], label='ft bias').divide(127.0)
     layer.bias.data = torch.cat([bias, torch.tensor([0] * num_psqt_buckets)])
-
     weights = self.tensor(numpy.int16, [input_dims, ft_out], label='ft weights').divide(127.0)
     psqtweights = self.tensor(numpy.int32, [input_dims, num_psqt_buckets], label='ft psqt').divide(9600.0)
+    layer.weight.data = torch.cat([weights, psqtweights], dim=1)
+
+  def read_feature_transformer_legacy_int8(self, layer, num_psqt_buckets):
+    ft_out = layer.bias.shape[0] - num_psqt_buckets
+    input_dims = layer.weight.shape[0]
+    bias = self.tensor(numpy.int16, [ft_out], label='legacy ft bias').divide(127.0)
+    if bias is None:
+      raise RuntimeError('Short read for legacy ft bias')
+    layer.bias.data = torch.cat([bias, torch.tensor([0] * num_psqt_buckets)])
+
+    weights = self.tensor(numpy.int8, [input_dims, ft_out], label='legacy ft weights int8')
+    if weights is None:
+      raise RuntimeError('Short read for legacy ft weights int8')
+    weights = weights.divide(127.0)
+
+    psqtweights = self.tensor(numpy.int16, [input_dims, num_psqt_buckets], label='legacy ft psqt int16', allow_eof=True)
+    if psqtweights is None:
+      print('NNUEReader warning: legacy FT PSQT section truncated/missing; initializing PSQT weights to zeros.')
+      psqtweights = torch.zeros((input_dims, num_psqt_buckets), dtype=torch.float32)
+    else:
+      psqtweights = psqtweights.divide(9600.0)
+
     layer.weight.data = torch.cat([weights, psqtweights], dim=1)
 
   def read_fc_layer(self, layer, is_output=False):
     kWeightScaleBits = 6
     kActivationScale = 127.0
-    if not is_output:
-      kBiasScale = (1 << kWeightScaleBits) * kActivationScale
-    else:
-      kBiasScale = 9600.0
+    kBiasScale = (1 << kWeightScaleBits) * kActivationScale if not is_output else 9600.0
     kWeightScale = kBiasScale / kActivationScale
-
     non_padded_shape = layer.weight.shape
     padded_shape = (non_padded_shape[0], ((non_padded_shape[1]+31)//32)*32)
-
     layer.bias.data = self.tensor(numpy.int32, layer.bias.shape, label='fc bias').divide(kBiasScale)
     layer.weight.data = self.tensor(numpy.int8, padded_shape, label='fc weight').divide(kWeightScale)
     layer.weight.data = layer.weight.data[:non_padded_shape[0], :non_padded_shape[1]]
@@ -280,6 +281,7 @@ def main():
   parser.add_argument("--l2-size", default=M.DEFAULT_L2, type=int, dest='l2_size', help="Hidden size override when loading .nnue/.ckpt.")
   parser.add_argument("--force-header-sizes", action='store_true', dest='force_header_sizes', help="Force parser to use --l1-size/--l2-size for .nnue, ignoring in-file values.")
   parser.add_argument("--nnue-use-real-features", action='store_true', dest='nnue_use_real_features', help="When loading .nnue, use real (non-virtual) features for input dimensions.")
+  parser.add_argument("--legacy-ft-only", action='store_true', dest='legacy_ft_only', help="Legacy bridge mode: load FT only (int8/int16), skip FC loading and keep trainer FC init.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -304,14 +306,14 @@ def main():
 
     try:
       with open(args.source, 'rb') as f:
-        reader = NNUEReader(f, load_feature_set, forced_l1=forced_l1, forced_l2=forced_l2)
+        reader = NNUEReader(f, load_feature_set, forced_l1=forced_l1, forced_l2=forced_l2, legacy_ft_only=args.legacy_ft_only)
         nnue = reader.model
     except RuntimeError as e:
       if 'Short read for ft weights' in str(e) and not args.nnue_use_real_features:
         fallback_feature_set = real_feature_set_from_training_set(feature_set)
         print(f"NNUEReader: retrying with real feature set due to FT short read: {fallback_feature_set.name}")
         with open(args.source, 'rb') as f:
-          reader = NNUEReader(f, fallback_feature_set, forced_l1=forced_l1, forced_l2=forced_l2)
+          reader = NNUEReader(f, fallback_feature_set, forced_l1=forced_l1, forced_l2=forced_l2, legacy_ft_only=args.legacy_ft_only)
           nnue = reader.model
       else:
         raise
