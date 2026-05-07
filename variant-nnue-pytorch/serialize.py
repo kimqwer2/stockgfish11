@@ -46,6 +46,12 @@ def feature_set_for_checkpoint(source, requested_feature_set):
   raise RuntimeError('Checkpoint input.weight has {} features, but requested feature set {} has {} training features and {} real features.'.format(
     checkpoint_features, requested_feature_set.name, requested_feature_set.num_features, requested_feature_set.num_real_features))
 
+
+
+def real_feature_set_from_training_set(feature_set):
+  real_feature_name = '+'.join(feature.get_main_factor_name() for feature in feature_set.features)
+  return features.get_feature_set_from_name(real_feature_name)
+
 VERSION = 0x7AF32F20
 DEFAULT_DESCRIPTION = "Network trained with the https://github.com/ianfab/variant-nnue-pytorch trainer."
 
@@ -273,6 +279,7 @@ def main():
   parser.add_argument("--l1-size", default=M.DEFAULT_L1, type=int, dest='l1_size', help="Hidden size override when loading .nnue/.ckpt.")
   parser.add_argument("--l2-size", default=M.DEFAULT_L2, type=int, dest='l2_size', help="Hidden size override when loading .nnue/.ckpt.")
   parser.add_argument("--force-header-sizes", action='store_true', dest='force_header_sizes', help="Force parser to use --l1-size/--l2-size for .nnue, ignoring in-file values.")
+  parser.add_argument("--nnue-use-real-features", action='store_true', dest='nnue_use_real_features', help="When loading .nnue, use real (non-virtual) features for input dimensions.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -287,11 +294,27 @@ def main():
   elif args.source.endswith('.pt'):
     nnue = torch.load(args.source, weights_only=False)
   elif args.source.endswith('.nnue'):
-    with open(args.source, 'rb') as f:
-      forced_l1 = args.l1_size if args.force_header_sizes else None
-      forced_l2 = args.l2_size if args.force_header_sizes else None
-      reader = NNUEReader(f, feature_set, forced_l1=forced_l1, forced_l2=forced_l2)
-      nnue = reader.model
+    load_feature_set = feature_set
+    if args.nnue_use_real_features:
+      load_feature_set = real_feature_set_from_training_set(feature_set)
+      print(f"NNUEReader: using real feature set for .nnue load: {load_feature_set.name}")
+
+    forced_l1 = args.l1_size if args.force_header_sizes else None
+    forced_l2 = args.l2_size if args.force_header_sizes else None
+
+    try:
+      with open(args.source, 'rb') as f:
+        reader = NNUEReader(f, load_feature_set, forced_l1=forced_l1, forced_l2=forced_l2)
+        nnue = reader.model
+    except RuntimeError as e:
+      if 'Short read for ft weights' in str(e) and not args.nnue_use_real_features:
+        fallback_feature_set = real_feature_set_from_training_set(feature_set)
+        print(f"NNUEReader: retrying with real feature set due to FT short read: {fallback_feature_set.name}")
+        with open(args.source, 'rb') as f:
+          reader = NNUEReader(f, fallback_feature_set, forced_l1=forced_l1, forced_l2=forced_l2)
+          nnue = reader.model
+      else:
+        raise
   else:
     raise Exception('Invalid network input format.')
 
