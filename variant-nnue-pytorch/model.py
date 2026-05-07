@@ -7,12 +7,9 @@ import copy
 from feature_transformer import DoubleFeatureTransformerSlice
 
 # 3 layer fully connected network
-DEFAULT_L1 = 256
-DEFAULT_L2 = 32
+L1 = 1024
+L2 = 16
 L3 = 32
-# Backward-compatible module defaults for scripts that import M.L1/M.L2
-L1 = DEFAULT_L1
-L2 = DEFAULT_L2
 
 def coalesce_ft_weights(model, layer):
   weight = layer.weight.data
@@ -26,20 +23,18 @@ def get_parameters(layers):
   return [p for layer in layers for p in layer.parameters()]
 
 class LayerStacks(nn.Module):
-  def __init__(self, count, l1_size, l2_size):
+  def __init__(self, count):
     super(LayerStacks, self).__init__()
 
     self.count = count
-    self.l1_size = l1_size
-    self.l2_size = l2_size
-    self.l1 = nn.Linear(2 * l1_size, l2_size * count)
+    self.l1 = nn.Linear(2 * L1, L2 * count)
     # Factorizer only for the first layer because later
     # there's a non-linearity and factorization breaks.
     # It breaks the min/max weight clipping but hopefully it's not bad.
     # TODO: try solving it
     #       one potential solution would be to coalesce the weights on each step.
-    self.l1_fact = nn.Linear(2 * l1_size, l2_size, bias=False)
-    self.l2 = nn.Linear(l2_size, L3 * count)
+    self.l1_fact = nn.Linear(2 * L1, L2, bias=False)
+    self.l2 = nn.Linear(L2, L3 * count)
     self.output = nn.Linear(L3, 1 * count)
 
     self.idx_offset = None
@@ -61,8 +56,8 @@ class LayerStacks(nn.Module):
       for i in range(1, self.count):
         # Make all layer stacks have the same initialization.
         # Basically copy the first to all other layer stacks.
-        l1_weight[i*self.l2_size:(i+1)*self.l2_size, :] = l1_weight[0:self.l2_size, :]
-        l1_bias[i*self.l2_size:(i+1)*self.l2_size] = l1_bias[0:self.l2_size]
+        l1_weight[i*L2:(i+1)*L2, :] = l1_weight[0:L2, :]
+        l1_bias[i*L2:(i+1)*L2] = l1_bias[0:L2]
         l2_weight[i*L3:(i+1)*L3, :] = l2_weight[0:L3, :]
         l2_bias[i*L3:(i+1)*L3] = l2_bias[0:L3]
         output_weight[i:i+1, :] = output_weight[0:1, :]
@@ -76,26 +71,18 @@ class LayerStacks(nn.Module):
     self.output.bias = nn.Parameter(output_bias)
 
   def forward(self, x, ls_indices):
-    # The C++ loader computes bucket ids from material count. Some variant
-    # datasets can produce a boundary value equal to the number of buckets,
-    # so clamp to the valid [0, count) range before using the ids for gathers.
-    ls_indices = ls_indices.flatten().to(device=x.device, dtype=torch.long).clamp(0, self.count - 1)
-
-    if ls_indices.numel() != x.shape[0]:
-      raise ValueError('Layer stack index count {} does not match batch size {}'.format(ls_indices.numel(), x.shape[0]))
-
     # precompute and cache the offset for gathers
-    if self.idx_offset == None or self.idx_offset.shape[0] != x.shape[0] or self.idx_offset.device != x.device:
-      self.idx_offset = torch.arange(0, x.shape[0] * self.count, self.count, device=x.device, dtype=torch.long)
+    if self.idx_offset == None or self.idx_offset.shape[0] != x.shape[0]:
+      self.idx_offset = torch.arange(0,x.shape[0]*self.count,self.count, device=ls_indices.device)
 
-    indices = ls_indices + self.idx_offset
+    indices = ls_indices.flatten() + self.idx_offset
 
-    l1s_ = self.l1(x).reshape((-1, self.count, self.l2_size))
+    l1s_ = self.l1(x).reshape((-1, self.count, L2))
     l1f_ = self.l1_fact(x)
     # https://stackoverflow.com/questions/55881002/pytorch-tensor-indexing-how-to-gather-rows-by-tensor-containing-indices
     # basically we present it as a list of individual results and pick not only based on
     # the ls index but also based on batch (they are combined into one index)
-    l1c_ = l1s_.view(-1, self.l2_size)[indices]
+    l1c_ = l1s_.view(-1, L2)[indices]
     l1x_ = torch.clamp(l1c_ + l1f_, 0.0, 1.0)
 
     l2s_ = self.l2(l1x_).reshape((-1, self.count, L3))
@@ -111,11 +98,11 @@ class LayerStacks(nn.Module):
   def get_coalesced_layer_stacks(self):
     for i in range(self.count):
       with torch.no_grad():
-        l1 = nn.Linear(2*self.l1_size, self.l2_size)
-        l2 = nn.Linear(self.l2_size, L3)
+        l1 = nn.Linear(2*L1, L2)
+        l2 = nn.Linear(L2, L3)
         output = nn.Linear(L3, 1)
-        l1.weight.data = self.l1.weight[i*self.l2_size:(i+1)*self.l2_size, :] + self.l1_fact.weight.data
-        l1.bias.data = self.l1.bias[i*self.l2_size:(i+1)*self.l2_size]
+        l1.weight.data = self.l1.weight[i*L2:(i+1)*L2, :] + self.l1_fact.weight.data
+        l1.bias.data = self.l1.bias[i*L2:(i+1)*L2]
         l2.weight.data = self.l2.weight[i*L3:(i+1)*L3, :]
         l2.bias.data = self.l2.bias[i*L3:(i+1)*L3]
         output.weight.data = self.output.weight[i:(i+1), :]
@@ -132,20 +119,13 @@ class NNUE(pl.LightningModule):
 
   It is not ideal for training a Pytorch quantized model directly.
   """
-  def __init__(self, feature_set, lambda_=0.8, scale=400.0, l1_size=DEFAULT_L1, l2_size=DEFAULT_L2):
+  def __init__(self, feature_set, lambda_=1.0):
     super(NNUE, self).__init__()
     self.num_psqt_buckets = feature_set.num_psqt_buckets
     self.num_ls_buckets = feature_set.num_ls_buckets
-    self.l1_size = l1_size
-    self.l2_size = l2_size
-    self.scale = scale
-    self.input = DoubleFeatureTransformerSlice(feature_set.num_features, self.l1_size + self.num_psqt_buckets)
-    # Keep an explicit feature-count alias on the transformer so all forward-time
-    # index normalization uses the same bound as the CUDA feature transformer.
-    self.input.num_features = self.input.num_inputs
+    self.input = DoubleFeatureTransformerSlice(feature_set.num_features, L1 + self.num_psqt_buckets)
     self.feature_set = feature_set
-    self._printed_index_debug = False
-    self.layer_stacks = LayerStacks(self.num_ls_buckets, self.l1_size, self.l2_size)
+    self.layer_stacks = LayerStacks(self.num_ls_buckets)
     self.lambda_ = lambda_
 
     self.weight_clipping = [
@@ -176,7 +156,7 @@ class NNUE(pl.LightningModule):
     input_bias = self.input.bias
     with torch.no_grad():
       for i in range(8):
-        input_bias[self.l1_size + i] = 0.0
+        input_bias[L1 + i] = 0.0
     self.input.bias = nn.Parameter(input_bias)
 
     self._zero_virtual_feature_weights()
@@ -190,7 +170,7 @@ class NNUE(pl.LightningModule):
       initial_values = self.feature_set.get_initial_psqt_features()
       assert len(initial_values) == self.feature_set.num_features
       for i in range(8):
-        input_weights[:, self.l1_size + i] = torch.FloatTensor(initial_values) * scale
+        input_weights[:, L1 + i] = torch.FloatTensor(initial_values) * scale
     self.input.weight = nn.Parameter(input_weights)
 
   '''
@@ -261,31 +241,10 @@ class NNUE(pl.LightningModule):
     else:
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
-  def _debug_index_tensor(self, name, indices):
-    if indices.numel() == 0:
-      return '{}=empty'.format(name)
-    return '{} min={} max={}'.format(name, int(indices.min().detach().cpu()), int(indices.max().detach().cpu()))
-
-  def forward(self, us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices, debug_indices=False):
-    if not hasattr(self.input, 'num_features'):
-      self.input.num_features = self.input.num_inputs
-
-    if debug_indices and not getattr(self, '_printed_index_debug', False):
-      print('NNUE index debug before clamp: {}, {}, {}, {}'.format(
-        self._debug_index_tensor('white', white_indices),
-        self._debug_index_tensor('black', black_indices),
-        self._debug_index_tensor('psqt', psqt_indices),
-        self._debug_index_tensor('layer_stack', layer_stack_indices)), flush=True)
-      self._printed_index_debug = True
-
-    white_indices = torch.clamp(white_indices, 0, self.input.num_features - 1).to(dtype=torch.int32).contiguous()
-    black_indices = torch.clamp(black_indices, 0, self.input.num_features - 1).to(dtype=torch.int32).contiguous()
-    psqt_indices = torch.clamp(psqt_indices.to(dtype=torch.long), 0, self.num_psqt_buckets - 1)
-    layer_stack_indices = torch.clamp(layer_stack_indices.to(dtype=torch.long), 0, self.layer_stacks.count - 1)
-
+  def forward(self, us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices):
     wp, bp = self.input(white_indices, white_values, black_indices, black_values)
-    w, wpsqt = torch.split(wp, self.l1_size, dim=1)
-    b, bpsqt = torch.split(bp, self.l1_size, dim=1)
+    w, wpsqt = torch.split(wp, L1, dim=1)
+    b, bpsqt = torch.split(bp, L1, dim=1)
     l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
     # clamp here is used as a clipped relu to (0.0, 1.0)
     l0_ = torch.clamp(l0_, 0.0, 1.0)
@@ -300,30 +259,30 @@ class NNUE(pl.LightningModule):
   def step_(self, batch, batch_idx, loss_type):
     self._clip_weights()
 
-    us, them, white_indices, white_values, black_indices, black_values, batch_wdl, batch_score, psqt_indices, layer_stack_indices = batch
+    us, them, white_indices, white_values, black_indices, black_values, outcome, score, psqt_indices, layer_stack_indices = batch
 
-    student_logits = self(
-      us,
-      them,
-      white_indices,
-      white_values,
-      black_indices,
-      black_values,
-      psqt_indices,
-      layer_stack_indices,
-      debug_indices=(batch_idx == 0),
-    ).view(-1)
+    # 600 is the kPonanzaConstant scaling factor needed to convert the training net output to a score.
+    # This needs to match the value used in the serializer
+    nnue2score = 600
+    in_scaling = 410
+    out_scaling = 361
 
-    batch_score = batch_score.view(-1)
-    batch_wdl = batch_wdl.view(-1)
+    q = (self(us, them, white_indices, white_values, black_indices, black_values, psqt_indices, layer_stack_indices) * nnue2score / out_scaling).sigmoid()
+    t = outcome
+    p = (score / in_scaling).sigmoid()
 
-
-    teacher_prob = torch.sigmoid(batch_score / self.scale)
-    p_target = self.lambda_ * teacher_prob + (1.0 - self.lambda_) * batch_wdl
-    loss = F.binary_cross_entropy_with_logits(student_logits, p_target)
+    loss_eval = (p - q).square().mean()
+    loss_result = (q - t).square().mean()
+    loss = self.lambda_ * loss_eval + (1.0 - self.lambda_) * loss_result
 
     self.log(loss_type, loss)
+
     return loss
+
+    # MSE Loss function for debugging
+    # Scale score by 600.0 to match the expected NNUE scaling factor
+    # output = self(us, them, white, black) * 600.0
+    # loss = F.mse_loss(output, score)
 
   def training_step(self, batch, batch_idx):
     return self.step_(batch, batch_idx, 'train_loss')
