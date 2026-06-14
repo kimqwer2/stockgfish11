@@ -1,0 +1,11 @@
+cd /workspaces/stockgfish11
+
+git clone https://github.com/fairy-stockfish/Fairy-Stockfish.git Fairy-Stockfish-development
+
+rm -rf Fairy-Stockfish-development/.git
+
+git add Fairy-Stockfish-development
+
+git commit -m "Add Fairy-Stockfish-development"
+
+git push origin main
