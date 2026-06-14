@@ -61,6 +61,11 @@ class TrainingDataProvider:
         batch_size=None,
         filtered=False,
         random_fen_skipping=0,
+        draw_relabel_score_threshold=None,
+        material_draw_relabel=False,
+        material_relabel_max_material=30,
+        material_relabel_min_ply=100,
+        material_relabel_margin=1,
         device='cpu'):
 
         self.feature_set = feature_set.encode('utf-8')
@@ -74,17 +79,24 @@ class TrainingDataProvider:
         self.batch_size = batch_size
         self.filtered = filtered
         self.random_fen_skipping = random_fen_skipping
+        self.draw_relabel_score_threshold = draw_relabel_score_threshold
+        self.material_draw_relabel = material_draw_relabel
+        self.material_relabel_max_material = material_relabel_max_material
+        self.material_relabel_min_ply = material_relabel_min_ply
+        self.material_relabel_margin = material_relabel_margin
         self.device = device
 
-        self.stream = self.create_stream(
-            self.feature_set,
-            self.num_workers,
-            self.filename,
-            self.batch_size,
-            cyclic,
-            filtered,
-            random_fen_skipping
-        )
+        if batch_size:
+            self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename, batch_size, cyclic, filtered, 
+            random_fen_skipping,
+            draw_relabel_score_threshold is not None,
+            0 if draw_relabel_score_threshold is None else draw_relabel_score_threshold,
+            material_draw_relabel,
+            material_relabel_max_material,
+            material_relabel_min_ply,
+            material_relabel_margin)
+        else:
+            self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename, cyclic, filtered, random_fen_skipping)
 
     def __iter__(self):
         return self
@@ -100,19 +112,24 @@ class TrainingDataProvider:
             raise StopIteration
 
     def __del__(self):
-        if hasattr(self, "stream"):
-            self.destroy_stream(self.stream)
+        self.destroy_stream(self.stream)
 
 create_sparse_batch_stream = dll.create_sparse_batch_stream
 create_sparse_batch_stream.restype = ctypes.c_void_p
 create_sparse_batch_stream.argtypes = [
-    ctypes.c_char_p,  # feature_set
-    ctypes.c_int,     # num_workers
-    ctypes.c_char_p,  # filename
-    ctypes.c_int,     # batch_size
-    ctypes.c_bool,    # cyclic
-    ctypes.c_bool,    # filtered
-    ctypes.c_int      # random_fen_skipping
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_bool,
+    ctypes.c_bool,
+    ctypes.c_int,     # random_fen_skipping
+    ctypes.c_bool,    # score_relabel_enabled
+    ctypes.c_int,     # draw_relabel_score_threshold
+    ctypes.c_bool,    # material_draw_relabel_enabled
+    ctypes.c_int,     # material_relabel_max_material
+    ctypes.c_int,     # material_relabel_min_ply
+    ctypes.c_int      # material_relabel_margin
 ]
 destroy_sparse_batch_stream = dll.destroy_sparse_batch_stream
 destroy_sparse_batch_stream.argtypes = [ctypes.c_void_p]
@@ -124,7 +141,7 @@ destroy_sparse_batch = dll.destroy_sparse_batch
 
 
 class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
+    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, draw_relabel_score_threshold=None, material_draw_relabel=False, material_relabel_max_material=30, material_relabel_min_ply=100, material_relabel_margin=1, device='cpu'):
         super(SparseBatchProvider, self).__init__(
             feature_set,
             create_sparse_batch_stream,
@@ -137,10 +154,15 @@ class SparseBatchProvider(TrainingDataProvider):
             batch_size,
             filtered,
             random_fen_skipping,
+            draw_relabel_score_threshold,
+            material_draw_relabel,
+            material_relabel_max_material,
+            material_relabel_min_ply,
+            material_relabel_margin,
             device)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
+  def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, draw_relabel_score_threshold=None, material_draw_relabel=False, material_relabel_max_material=30, material_relabel_min_ply=100, material_relabel_margin=1, device='cpu'):
     super(SparseBatchDataset).__init__()
     self.feature_set = feature_set
     self.filename = filename
@@ -149,15 +171,20 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.num_workers = num_workers
     self.filtered = filtered
     self.random_fen_skipping = random_fen_skipping
+    self.draw_relabel_score_threshold = draw_relabel_score_threshold
+    self.material_draw_relabel = material_draw_relabel
+    self.material_relabel_max_material = material_relabel_max_material
+    self.material_relabel_min_ply = material_relabel_min_ply
+    self.material_relabel_margin = material_relabel_margin
     self.device = device
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device)
+    return SparseBatchProvider(self.feature_set, self.filename, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, draw_relabel_score_threshold=self.draw_relabel_score_threshold, material_draw_relabel=self.material_draw_relabel, material_relabel_max_material=self.material_relabel_max_material, material_relabel_min_ply=self.material_relabel_min_ply, material_relabel_margin=self.material_relabel_margin, device=self.device)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):
     super(FixedNumBatchesDataset, self).__init__()
-    self.dataset = dataset
+    self.dataset = dataset;
     self.iter = iter(self.dataset)
     self.num_batches = num_batches
 

@@ -9,12 +9,14 @@ from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
 
-def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size):
+def make_data_loaders(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, val_size, relabel_options):
   features_name = feature_set.name
   train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device)
+                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device,
+                                                   **relabel_options)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, batch_size, filtered=filtered,
-                                                   random_fen_skipping=random_fen_skipping, device=main_device)
+                                                   random_fen_skipping=random_fen_skipping, device=main_device,
+                                                   **relabel_options)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
   train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
@@ -23,15 +25,15 @@ def make_data_loaders(train_filename, val_filename, feature_set, num_workers, ba
 
 def main():
   parser = argparse.ArgumentParser(description="Trains the network.")
-  parser.add_argument("train", help="Training data (.bin)")
-  parser.add_argument("val", help="Validation data (.bin)")
+  parser.add_argument("train", help="Training data (.bin or .binpack)")
+  parser.add_argument("val", help="Validation data (.bin or .binpack)")
   parser = pl.Trainer.add_argparse_args(parser)
-  parser.add_argument("--lambda", default=0.8, type=float, dest='lambda_', help="KD blend weight for teacher eval probability (default=0.8).")
-  parser.add_argument("--score-weight", default=None, type=float, dest='score_weight', help="Alias for --lambda. If set, overrides --lambda.")
-  parser.add_argument("--scale", default=400.0, type=float, dest='scale', help="Evaluation scaling constant for sigmoid/BCE targets (default=400.0).")
-  parser.add_argument("--l1-size", default=256, type=int, dest='l1_size', help="Hidden size of feature transformer output (default=256).")
-  parser.add_argument("--l2-size", default=32, type=int, dest='l2_size', help="Hidden size of first layer stack layer (default=32).")
-  parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for bin.")
+  parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
+  parser.add_argument("--start-lambda", default=None, type=float, dest='start_lambda', help="lambda to use at first epoch.")
+  parser.add_argument("--end-lambda", default=None, type=float, dest='end_lambda', help="lambda to use at last epoch.")
+  parser.add_argument("--gamma", default=0.992, type=float, dest='gamma', help="Multiplicative factor applied to the learning rate after every epoch.")
+  parser.add_argument("--lr", default=8.75e-4, type=float, dest='lr', help="Initial learning rate.")
+  parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for binpack.")
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
   parser.add_argument("--seed", default=42, type=int, dest='seed', help="torch seed to use.")
@@ -40,7 +42,12 @@ def main():
   parser.add_argument("--random-fen-skipping", default=3, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
   parser.add_argument("--epoch-size", type=int, default=20000000, dest='epoch_size', help="Number of positions per epoch.")
-  parser.add_argument("--validation-size", type=int, default=1000000, dest='validation_size', help="Number of positions per validation step.")
+  parser.add_argument("--validation-size", type=int, default=10000, dest='validation_size', help="Number of positions per validation step.")
+  parser.add_argument("--draw-relabel-score-threshold", type=int, default=None, dest='draw_relabel_score_threshold', help="If set, relabel draw samples with abs(score) at or above this threshold to score-sign wins/losses.")
+  parser.add_argument("--material-draw-relabel", action='store_true', dest='material_draw_relabel', help="Relabel late low-material draws using the variant's material-counting rules.")
+  parser.add_argument("--material-relabel-max-material", type=int, default=30, dest='material_relabel_max_material', help="Maximum per-side material for material draw relabeling (default: 30).")
+  parser.add_argument("--material-relabel-min-ply", type=int, default=100, dest='material_relabel_min_ply', help="Minimum game ply for material draw relabeling (default: 100).")
+  parser.add_argument("--material-relabel-margin", type=int, default=1, dest='material_relabel_margin', help="Material score margin required for material draw relabeling (default: 1).")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -49,23 +56,32 @@ def main():
   if not os.path.exists(args.val):
     raise Exception('{0} does not exist'.format(args.val))
 
+  if (args.start_lambda is not None) != (args.end_lambda is not None):
+    raise Exception('Either both or none of start_lambda and end_lambda must be specified.')
+
   feature_set = features.get_feature_set_from_name(args.features)
 
-  if args.score_weight is not None:
-    args.lambda_ = args.score_weight
-
+  start_lambda = args.start_lambda or args.lambda_
+  end_lambda = args.end_lambda or args.lambda_
+  max_epoch = args.max_epochs or 5
   if args.resume_from_model is None:
-    nnue = M.NNUE(feature_set=feature_set, lambda_=args.lambda_, scale=args.scale, l1_size=args.l1_size, l2_size=args.l2_size)
+    nnue = M.NNUE(feature_set=feature_set, 
+      start_lambda=start_lambda,
+      max_epoch=max_epoch,
+      end_lambda=end_lambda, gamma=args.gamma, lr=args.lr)
     nnue.cuda()
   else:
     # Load with weights_only=False to avoid safe_globals complexity
     # This is safe since we trust the checkpoint source
     nnue = torch.load(args.resume_from_model, weights_only=False)
     nnue.set_feature_set(feature_set)
-    nnue.lambda_ = args.lambda_
-    nnue.scale = args.scale
-    nnue.l1_size = args.l1_size
-    nnue.l2_size = args.l2_size
+    nnue.start_lambda = start_lambda
+    nnue.end_lambda = end_lambda
+    nnue.max_epoch = max_epoch
+    # we can set the following here just like that because when resuming
+    # from .pt the optimizer is only created after the training is started
+    nnue.gamma = args.gamma
+    nnue.lr = args.lr
     nnue.cuda()
 
   print("Feature set: {}".format(feature_set.name))
@@ -85,6 +101,13 @@ def main():
 
   print('Smart fen skipping: {}'.format(not args.no_smart_fen_skipping))
   print('Random fen skipping: {}'.format(args.random_fen_skipping))
+  if args.draw_relabel_score_threshold is not None:
+    print('Score draw relabel threshold: {}'.format(args.draw_relabel_score_threshold))
+  if args.material_draw_relabel:
+    print('Material draw relabel: enabled')
+    print('Material relabel max material: {}'.format(args.material_relabel_max_material))
+    print('Material relabel min ply: {}'.format(args.material_relabel_min_ply))
+    print('Material relabel margin: {}'.format(args.material_relabel_margin))
 
   if args.threads > 0:
     print('limiting torch to {} threads.'.format(args.threads))
@@ -100,7 +123,15 @@ def main():
   main_device = trainer.strategy.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
 
   print('Using c++ data loader')
-  train, val = make_data_loaders(args.train, args.val, feature_set, args.num_workers, batch_size, not args.no_smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.validation_size)
+
+  relabel_options = {
+    'draw_relabel_score_threshold': args.draw_relabel_score_threshold,
+    'material_draw_relabel': args.material_draw_relabel,
+    'material_relabel_max_material': args.material_relabel_max_material,
+    'material_relabel_min_ply': args.material_relabel_min_ply,
+    'material_relabel_margin': args.material_relabel_margin,
+  }
+  train, val = make_data_loaders(args.train, args.val, feature_set, args.num_workers, batch_size, not args.no_smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.validation_size, relabel_options)
 
   trainer.fit(nnue, train, val)
 
