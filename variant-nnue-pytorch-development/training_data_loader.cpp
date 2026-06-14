@@ -306,6 +306,56 @@ struct HalfKAv2Factorized {
     }
 };
 
+struct HalfKAv2JanggiFactorized {
+    // Training-only factors for Janggi: regular kingless A, plus compact
+    // king-piece and material-like piece planes. Serialization coalesces these
+    // back into the regular HalfKAv2 real feature rows used by the engine.
+    static constexpr int NUM_PT = (static_cast<int>(PieceType::MaxPiece) + 1) * 2;
+    static constexpr int A_INPUTS = HalfKAv2::NUM_SQ * NUM_PT;
+    static constexpr int KPT_INPUTS = HalfKAv2::NUM_KSQ * NUM_PT;
+    static constexpr int PT_INPUTS = NUM_PT;
+    static constexpr int INPUTS = HalfKAv2::INPUTS + A_INPUTS + KPT_INPUTS + PT_INPUTS;
+
+    static constexpr int MAX_PIECE_FEATURES = 3 * MAX_PIECES;
+    static constexpr int MAX_ACTIVE_FEATURES = HalfKAv2::MAX_ACTIVE_FEATURES + MAX_PIECE_FEATURES;
+
+    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
+    {
+        const auto [start_j, offset] = HalfKAv2::fill_features_sparse(e, features, values, color);
+        auto& pos = e.pos;
+        const int k_idx = map_king(orient_flip(color, pos.kingSquare(color)));
+        const int a_offset = offset;
+        const int kpt_offset = a_offset + A_INPUTS;
+        const int pt_offset = kpt_offset + KPT_INPUTS;
+
+        int j = start_j;
+        for(Square sq = Square::MIN; sq <= Square::MAX; ++sq)
+        {
+            auto p = pos.pieceAt(sq);
+            if (p == Piece::None)
+                continue;
+
+            auto p_idx = static_cast<int>(type_of(p)) * 2 + (color_of(p) != color);
+            const auto oriented_sq = static_cast<int>(orient_flip(color, sq));
+
+            values[j] = 1.0f;
+            features[j] = a_offset + p_idx * HalfKAv2::NUM_SQ + oriented_sq;
+            ++j;
+
+            values[j] = 1.0f;
+            features[j] = kpt_offset + k_idx * NUM_PT + p_idx;
+            ++j;
+
+            values[j] = 1.0f;
+            features[j] = pt_offset + p_idx;
+            ++j;
+        }
+
+        return { j, INPUTS };
+    }
+};
+
+
 template <typename T, typename... Ts>
 struct FeatureSet
 {
@@ -643,6 +693,10 @@ extern "C" {
         else if (feature_set == "HalfKAv2^")
         {
             return new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+        }
+        else if (feature_set == "HalfKAv2^J")
+        {
+            return new FeaturedBatchStream<FeatureSet<HalfKAv2JanggiFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
         }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;

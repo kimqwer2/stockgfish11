@@ -109,5 +109,48 @@ class FactorizedFeatures(FeatureBlock):
 '''
 This is used by the features module for discovery of feature blocks.
 '''
+class JanggiFactorizedFeatures(FeatureBlock):
+  def __init__(self):
+    super(JanggiFactorizedFeatures, self).__init__('HalfKAv2^J', 0x5f234cb8, OrderedDict([
+      ('HalfKAv2J', NUM_PLANES_REAL * NUM_KSQ),
+      ('A', NUM_PLANES_VIRTUAL),
+      ('KPT', NUM_KSQ * NUM_PT_VIRTUAL),
+      ('PT', NUM_PT_VIRTUAL),
+    ]))
+    # Keep the serialized/effective feature block compatible with the engine's
+    # regular HalfKAv2 feature transformer and existing .nnue hash.
+    self.num_real_features = NUM_PLANES_REAL * NUM_KSQ
+
+  def get_main_factor_name(self):
+    return 'HalfKAv2'
+
+  def get_active_features(self, board: chess.Board):
+    raise Exception('Not supported yet, you must use the c++ data loader for factorizer support during training')
+
+  def get_feature_factors(self, idx):
+    if idx >= self.num_real_features:
+      raise Exception('Feature must be real')
+
+    a_idx = idx % NUM_PLANES_REAL
+    k_idx = idx // NUM_PLANES_REAL
+    virtual_a_idx = a_idx
+
+    if NUM_PT_VIRTUAL != NUM_PT_REAL:
+      if virtual_a_idx // NUM_SQ == NUM_PT_REAL - 1 and k_idx != map_king(virtual_a_idx % NUM_SQ):
+        virtual_a_idx += NUM_SQ
+      elif virtual_a_idx >= NUM_SQ * NUM_PT_REAL:
+        virtual_a_idx += NUM_SQ
+
+    pt_idx = virtual_a_idx // NUM_SQ
+    return [
+      idx,
+      self.get_factor_base_feature('A') + virtual_a_idx,
+      self.get_factor_base_feature('KPT') + k_idx * NUM_PT_VIRTUAL + pt_idx,
+      self.get_factor_base_feature('PT') + pt_idx,
+    ]
+
+  def get_initial_psqt_features(self):
+    return halfka_psqts() + [0] * (NUM_PLANES_VIRTUAL + NUM_KSQ * NUM_PT_VIRTUAL + NUM_PT_VIRTUAL)
+
 def get_feature_block_clss():
-  return [Features, FactorizedFeatures]
+  return [Features, FactorizedFeatures, JanggiFactorizedFeatures]
