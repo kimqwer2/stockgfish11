@@ -15,23 +15,17 @@ NUM_PLANES_VIRTUAL = NUM_SQ * NUM_PT_VIRTUAL + (NUM_PT_REAL - (NUM_KSQ != 1)) * 
 NUM_INPUTS = NUM_PLANES_REAL * NUM_KSQ
 
 def orient(is_white_pov: bool, sq: int):
-  # Match Fairy-Stockfish HalfKAv2Variants::orient(): variant squares are
-  # rank * FILES + file, and the non-white perspective flips ranks only.
   return sq % variant.FILES + (variant.RANKS - 1 - (sq // variant.FILES)) * variant.FILES if not is_white_pov else sq
 
 def halfka_idx(is_white_pov: bool, king_sq: int, sq: int, piece_type: int, color: bool):
-  # piece_type is the 0-based Fairy NNUE plane index for Janggi:
-  # rook, cannon, soldier, horse/knight, elephant, advisor/guard, king.
-  # In Fairy's Janggi FEN/debug path, lowercase startpos pieces are Color::WHITE
-  # for NNUE indexing and uppercase pieces are Color::BLACK.
-  p_idx = piece_type * 2 + (color != is_white_pov)
+  p_idx = (piece_type - 1) * 2 + (color != is_white_pov)
   if NUM_PT_REAL % 2 and p_idx == NUM_PT_REAL:
     # merge kings into one plane
     p_idx -= 1
   return orient(is_white_pov, sq) + p_idx * NUM_SQ + king_sq * NUM_PLANES_REAL
 
 def halfka_hand_idx(is_white_pov: bool, king_sq: int, handCount: int, piece_type: int, color: bool):
-  p_idx = piece_type * 2 + (color != is_white_pov)
+  p_idx = (piece_type - 1) * 2 + (color != is_white_pov)
   return handCount + p_idx * variant.POCKETS + NUM_SQ * NUM_PT_REAL + king_sq * NUM_PLANES_REAL
 
 def map_king(sq: int):
@@ -70,9 +64,8 @@ class Features(FeatureBlock):
   def get_active_features(self, board: chess.Board):
     def piece_features(turn):
       indices = torch.zeros(NUM_PLANES_REAL * NUM_KSQ)
-      king_bucket = map_king(orient(turn, board.king(turn)))
       for sq, p in board.piece_map().items():
-        indices[halfka_idx(turn, king_bucket, sq, p.piece_type - 1, p.color)] = 1.0
+        indices[halfka_idx(turn, orient(turn, board.king(turn)), sq, p)] = 1.0
       return indices
     return (piece_features(chess.WHITE), piece_features(chess.BLACK))
 
@@ -109,5 +102,48 @@ class FactorizedFeatures(FeatureBlock):
 '''
 This is used by the features module for discovery of feature blocks.
 '''
+class JanggiFactorizedFeatures(FeatureBlock):
+  def __init__(self):
+    super(JanggiFactorizedFeatures, self).__init__('HalfKAv2^J', 0x5f234cb8, OrderedDict([
+      ('HalfKAv2J', NUM_PLANES_REAL * NUM_KSQ),
+      ('A', NUM_PLANES_VIRTUAL),
+      ('KPT', NUM_KSQ * NUM_PT_VIRTUAL),
+      ('PT', NUM_PT_VIRTUAL),
+    ]))
+    # Keep the serialized/effective feature block compatible with the engine's
+    # regular HalfKAv2 feature transformer and existing .nnue hash.
+    self.num_real_features = NUM_PLANES_REAL * NUM_KSQ
+
+  def get_main_factor_name(self):
+    return 'HalfKAv2'
+
+  def get_active_features(self, board: chess.Board):
+    raise Exception('Not supported yet, you must use the c++ data loader for factorizer support during training')
+
+  def get_feature_factors(self, idx):
+    if idx >= self.num_real_features:
+      raise Exception('Feature must be real')
+
+    a_idx = idx % NUM_PLANES_REAL
+    k_idx = idx // NUM_PLANES_REAL
+    virtual_a_idx = a_idx
+
+    if NUM_PT_VIRTUAL != NUM_PT_REAL:
+      if virtual_a_idx // NUM_SQ == NUM_PT_REAL - 1 and k_idx != map_king(virtual_a_idx % NUM_SQ):
+        virtual_a_idx += NUM_SQ
+      elif virtual_a_idx >= NUM_SQ * NUM_PT_REAL:
+        virtual_a_idx += NUM_SQ
+
+    pt_idx = virtual_a_idx // NUM_SQ
+    return [
+      idx,
+      self.get_factor_base_feature('A') + virtual_a_idx,
+      self.get_factor_base_feature('KPT') + k_idx * NUM_PT_VIRTUAL + pt_idx,
+      self.get_factor_base_feature('PT') + pt_idx,
+    ]
+
+  def get_initial_psqt_features(self):
+    return halfka_psqts() + [0] * (NUM_PLANES_VIRTUAL + NUM_KSQ * NUM_PT_VIRTUAL + NUM_PT_VIRTUAL)
+
 def get_feature_block_clss():
-  return [Features, FactorizedFeatures]
+  return [Features, FactorizedFeatures, JanggiFactorizedFeatures]

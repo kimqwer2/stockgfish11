@@ -34,7 +34,7 @@ def do_plot(data, filename):
     # plot of the perf% by eval and the fitted sigmoid
     x = list(data.keys())
     y = [data[k][0] / data[k][1] for k in x]
-    # sigma is uncertainties, we don't care how correct it is.
+    # sigma is uncertainties, we con't care how correct it is.
     # The inverted counts are good enough.
     sigma = [1 / data[k][1] for k in x]
     k = fit_data(x, y, sigma)
@@ -81,7 +81,7 @@ def gather_statistics_from_batches(batches, bucket_size):
 
 def gather_statistics_from_data(filename, count, bucket_size):
     '''
-    Takes a .bin file and produces perf% statistics
+    Takes a .bin or .binpack file and produces perf% statistics
     The result is a dictionary of the form { eval : (perf%, count) }
     '''
     batch_size = 8192
