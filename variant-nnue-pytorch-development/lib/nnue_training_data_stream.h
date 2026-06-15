@@ -10,7 +10,7 @@
 
 namespace training_data {
 
-    using namespace bin;
+    using namespace binpack;
 
     static bool ends_with(const std::string& lhs, const std::string& end)
     {

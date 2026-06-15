@@ -54,7 +54,13 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <intrin.h>
 #endif
 
-#include "../variant.h"
+#define FILES 9
+#define RANKS 10
+#define PIECE_TYPES 7
+#define PIECE_COUNT 32
+#define POCKETS false
+#define KING_SQUARES 9
+#define DATA_SIZE 512
 
 static_assert(DATA_SIZE % 8 == 0);
 
@@ -440,7 +446,7 @@ namespace chess
 
 }
 
-namespace bin
+namespace binpack
 {
     constexpr std::size_t KiB = 1024;
     constexpr std::size_t MiB = (1024*KiB);
@@ -506,8 +512,8 @@ namespace bin
             // Used when finding the match rate with the teacher
             StockfishMove move;
 
-            // Ply index from the start position (stored as signed 8-bit in binpack format).
-            int8_t gamePly;
+            // Trouble of the phase from the initial phase.
+            uint16_t gamePly;
 
             // 1 if the player on this side ultimately wins the game. -1 if you are losing.
             // 0 if a draw is reached.
@@ -516,10 +522,10 @@ namespace bin
             int8_t game_result;
 
             // When exchanging the file that wrote the teacher aspect with other people
-            // Keep explicit padding so layout stays: 32 + 2 + 2 + 1 + 1 + 2 = 40 bytes.
-            uint16_t padding;
+            //Because this structure size is not fixed, pad it so that it is 40 bytes in any environment.
+            uint8_t padding;
 
-            // 32 + 2 + 2 + 1 + 1 + 2 = 40 bytes
+            // 32 + 2 + 2 + 2 + 1 + 1 = 40bytes
         };
         static_assert(sizeof(PackedSfenValue) == DATA_SIZE / 8 + 8);
         // Class that handles bitstream
@@ -708,7 +714,7 @@ namespace bin
 
             for (chess::Color c : { chess::Color::White, chess::Color::Black })
                 for (chess::PieceType pt = chess::PieceType::Pawn; pt <= chess::PieceType::MaxPiece; ++pt)
-                    pos.setHandCount(make_piece(pt, c), static_cast<int>(stream.read_n_bit(DATA_SIZE > 512 ? 7 : 5)));
+                    pos.setHandCount(make_piece(pt, c), static_cast<int>(stream.read_n_bit(5)));
 
             // Castling availability.
             chess::CastlingRights cr = chess::CastlingRights::None;
@@ -740,7 +746,7 @@ namespace bin
 
             // Fullmove number, high bits
             // This was added as a fix for fullmove clock
-            // overflowing at 256. This change is backwards compatible.
+            // overflowing at 256. This change is backwards compatibile.
             fullmove |= stream.read_n_bit(8) << 8;
 
             // Read the highest bit of rule50. This was added as a fix for rule50
