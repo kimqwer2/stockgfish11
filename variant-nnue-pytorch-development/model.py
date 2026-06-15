@@ -167,6 +167,27 @@ class NNUE(pl.LightningModule):
     self._zero_virtual_feature_weights()
     self._init_psqt()
 
+  def load_state_dict(self, state_dict, strict=True):
+    # Allow a plain HalfKAv2 checkpoint to seed a factorized training run.
+    # The engine-visible rows are identical; training-only virtual rows are
+    # initialized to zero and learned only by the new run.  This keeps existing
+    # checkpoints usable with feature sets such as HalfKAv2^ and HalfKAv2^J.
+    input_weight_key = 'input.weight'
+    if input_weight_key in state_dict:
+      checkpoint_weight = state_dict[input_weight_key]
+      model_weight = self.input.weight
+      if checkpoint_weight.shape[1] == model_weight.shape[1] and checkpoint_weight.shape[0] != model_weight.shape[0]:
+        if checkpoint_weight.shape[0] == self.feature_set.num_real_features and model_weight.shape[0] == self.feature_set.num_features:
+          expanded_weight = model_weight.new_zeros(model_weight.shape)
+          expanded_weight[:checkpoint_weight.shape[0], :] = checkpoint_weight.to(device=expanded_weight.device, dtype=expanded_weight.dtype)
+          state_dict = dict(state_dict)
+          state_dict[input_weight_key] = expanded_weight
+        elif checkpoint_weight.shape[0] == self.feature_set.num_features and model_weight.shape[0] == self.feature_set.num_real_features:
+          state_dict = dict(state_dict)
+          state_dict[input_weight_key] = checkpoint_weight[:model_weight.shape[0], :]
+
+    return super(NNUE, self).load_state_dict(state_dict, strict=strict)
+
   def _init_psqt(self):
     input_weights = self.input.weight
     # 1.0 / kPonanzaConstant
@@ -236,7 +257,7 @@ class NNUE(pl.LightningModule):
     # and we would like feature block implementers to follow this convention.
     # So if our current feature_set matches the first factor in the new_feature_set
     # we only have to add the virtual feature on top of the already existing real ones.
-    if old_feature_block.name == next(iter(new_feature_block.factors)):
+    if old_feature_block.name == new_feature_block.get_main_factor_name():
       # We can just extend with zeros since it's unfactorized -> factorized
       weights = self.input.weight
       padding = weights.new_zeros((new_feature_block.num_virtual_features, weights.shape[1]))

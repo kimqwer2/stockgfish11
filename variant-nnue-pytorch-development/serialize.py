@@ -138,7 +138,7 @@ class NNUEReader():
 
     self.read_header(feature_set, fc_hash)
     self.read_int32(feature_set.hash ^ (M.L1*2)) # Feature transformer hash
-    self.read_feature_transformer(self.model.input, self.model.num_psqt_buckets)
+    self.read_feature_transformer(self.model.input, self.model.num_psqt_buckets, feature_set.num_real_features)
     for i in range(self.model.num_ls_buckets):
       l1 = nn.Linear(2*M.L1, M.L2)
       l2 = nn.Linear(M.L2, M.L3)
@@ -166,16 +166,21 @@ class NNUEReader():
     d = d.reshape(shape)
     return d
 
-  def read_feature_transformer(self, layer, num_psqt_buckets):
+  def read_feature_transformer(self, layer, num_psqt_buckets, num_real_features):
     bias = self.tensor(numpy.int16, [layer.bias.shape[0]-num_psqt_buckets]).divide(127.0)
     layer.bias.data = torch.cat([bias, torch.tensor([0]*num_psqt_buckets)])
-    # weights stored as [41024][256], so we need to transpose the pytorch [256][41024]
+    # Serialized .nnue files contain only engine-visible (real) feature rows.
+    # Factorized training sets may have extra virtual rows in the pytorch model;
+    # initialize those rows to zero instead of trying to read them from disk.
     shape = layer.weight.shape
-    weights = self.tensor(numpy.int16, [shape[0], shape[1]-num_psqt_buckets])
-    psqtweights = self.tensor(numpy.int32, [shape[0], num_psqt_buckets])
+    weights = self.tensor(numpy.int16, [num_real_features, shape[1]-num_psqt_buckets])
+    psqtweights = self.tensor(numpy.int32, [num_real_features, num_psqt_buckets])
     weights = weights.divide(127.0)
     psqtweights = psqtweights.divide(9600.0)
-    layer.weight.data = torch.cat([weights, psqtweights], dim=1)
+    real_weight = torch.cat([weights, psqtweights], dim=1)
+    full_weight = layer.weight.data.new_zeros(shape)
+    full_weight[:num_real_features, :] = real_weight
+    layer.weight.data = full_weight
 
   def read_fc_layer(self, layer, is_output=False):
     # FC layers are stored as int8 weights, and int32 biases
