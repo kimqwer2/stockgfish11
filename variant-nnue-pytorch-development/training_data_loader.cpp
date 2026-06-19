@@ -8,6 +8,8 @@
 #include <thread>
 #include <deque>
 #include <random>
+#include <cstdint>
+#include <cstdlib>
 
 #include "lib/nnue_training_data_formats.h"
 #include "lib/nnue_training_data_stream.h"
@@ -61,6 +63,199 @@ static Square orient_flip(Color color, Square sq)
         return flip_vertically(sq);
     }
 }
+
+struct RelabelOptions
+{
+    bool score_relabel_enabled = false;
+    int draw_relabel_score_threshold = 0;
+    bool material_draw_relabel_enabled = false;
+    int material_relabel_max_material = 30;
+    int material_relabel_min_ply = 100;
+    int material_relabel_margin = 1;
+    bool material_cp_validation_enabled = false;
+    int material_cp_validation_threshold = 0;
+};
+
+struct RelabelStats
+{
+    std::uint64_t original_draws = 0;
+    std::uint64_t converted_by_score = 0;
+    std::uint64_t converted_by_material = 0;
+    std::uint64_t rejected_by_material_cp_validation = 0;
+    std::uint64_t remaining_draws = 0;
+};
+
+class TrainingDataRelabeler
+{
+public:
+    explicit TrainingDataRelabeler(RelabelOptions options) : m_options(options) {}
+
+    bool enabled() const
+    {
+        return m_options.score_relabel_enabled || m_options.material_draw_relabel_enabled;
+    }
+
+    void print_startup(const char* filename) const
+    {
+        if (!enabled())
+            return;
+
+        std::cerr << "Training data relabeling for " << filename << ":\n"
+                  << "  score draw relabeling: "
+                  << (m_options.score_relabel_enabled ? "enabled" : "disabled");
+        if (m_options.score_relabel_enabled)
+            std::cerr << " (threshold=" << m_options.draw_relabel_score_threshold << ")";
+        std::cerr << "\n"
+                  << "  material draw relabeling: "
+                  << (m_options.material_draw_relabel_enabled ? "enabled" : "disabled");
+        if (m_options.material_draw_relabel_enabled)
+        {
+            std::cerr << " (max_material=" << m_options.material_relabel_max_material
+                      << ", min_ply=" << m_options.material_relabel_min_ply
+                      << ", margin=" << m_options.material_relabel_margin;
+            if (m_options.material_cp_validation_enabled)
+                std::cerr << ", cp_validation_threshold=" << m_options.material_cp_validation_threshold;
+            std::cerr << ")";
+        }
+        std::cerr << std::endl;
+    }
+
+    void print_stats(const char* filename) const
+    {
+        if (!enabled())
+            return;
+
+        std::cerr << "Training data relabeling statistics for " << filename << ":\n"
+                  << "  Original draws: " << m_stats.original_draws << "\n"
+                  << "  Converted by score rule: " << m_stats.converted_by_score << "\n"
+                  << "  Converted by material rule: " << m_stats.converted_by_material << "\n"
+                  << "  Rejected by material CP validation: " << m_stats.rejected_by_material_cp_validation << "\n"
+                  << "  Remaining draws: " << m_stats.remaining_draws << std::endl;
+    }
+
+    void relabel(std::vector<TrainingDataEntry>& entries)
+    {
+        if (!m_options.score_relabel_enabled && !m_options.material_draw_relabel_enabled)
+            return;
+
+        for (auto& entry : entries)
+            relabel(entry);
+    }
+
+private:
+    static int material_weight(PieceType pt)
+    {
+        // The trainer's packed Janggi piece order mirrors Fairy-Stockfish's NNUE order:
+        // 0 rook, 1 cannon, 2 soldier, 3 horse, 4 elephant, 5 advisor, 6 king.
+        // These values are copied from Position::material_counting_result() for
+        // JANGGI_MATERIAL in Fairy-Stockfish.
+        static constexpr int weights[] = {13, 7, 2, 5, 3, 3, 0};
+        const auto idx = static_cast<int>(pt);
+        if (idx < 0 || idx >= static_cast<int>(std::size(weights)))
+            return 0;
+        return weights[idx];
+    }
+
+    static int side_material(const Position& pos, Color color)
+    {
+        int total = 0;
+        for (Square sq = Square::MIN; sq <= Square::MAX; ++sq)
+        {
+            const auto piece = pos.pieceAt(sq);
+            if (piece != Piece::None && color_of(piece) == color)
+                total += material_weight(type_of(piece));
+        }
+
+        for (PieceType pt = PieceType::Pawn; pt <= PieceType::King; ++pt)
+            total += pos.getHandCount(make_piece(pt, color)) * material_weight(pt);
+
+        return total;
+    }
+
+    static int material_score(const TrainingDataEntry& entry, int& white_material, int& black_material)
+    {
+        white_material = side_material(entry.pos, Color::White);
+        black_material = side_material(entry.pos, Color::Black);
+
+        // Fairy-Stockfish Janggi material counting computes white material minus
+        // black material, then applies black's 1-point komi before deciding the
+        // winner. Orient the numeric score to the side to move to match the score
+        // and game_result convention used by the trainer.
+        const int white_relative_score = white_material - black_material - 1;
+        return entry.pos.sideToMove() == Color::White ? white_relative_score : -white_relative_score;
+    }
+
+    void relabel(TrainingDataEntry& entry)
+    {
+        if (entry.result != 0)
+            return;
+
+        ++m_stats.original_draws;
+
+        if (m_options.score_relabel_enabled && std::abs(static_cast<int>(entry.score)) >= m_options.draw_relabel_score_threshold)
+        {
+            if (entry.score > 0)
+            {
+                entry.result = 1;
+                ++m_stats.converted_by_score;
+                return;
+            }
+            if (entry.score < 0)
+            {
+                entry.result = -1;
+                ++m_stats.converted_by_score;
+                return;
+            }
+        }
+
+        if (m_options.material_draw_relabel_enabled && static_cast<int>(entry.ply) >= m_options.material_relabel_min_ply)
+        {
+            int white_material = 0;
+            int black_material = 0;
+            const int score = material_score(entry, white_material, black_material);
+
+            if (white_material < m_options.material_relabel_max_material
+                && black_material < m_options.material_relabel_max_material)
+            {
+                if (score > m_options.material_relabel_margin)
+                {
+                    if (material_cp_validation_allows(entry, 1))
+                    {
+                        entry.result = 1;
+                        ++m_stats.converted_by_material;
+                        return;
+                    }
+                    ++m_stats.rejected_by_material_cp_validation;
+                }
+                if (score < -m_options.material_relabel_margin)
+                {
+                    if (material_cp_validation_allows(entry, -1))
+                    {
+                        entry.result = -1;
+                        ++m_stats.converted_by_material;
+                        return;
+                    }
+                    ++m_stats.rejected_by_material_cp_validation;
+                }
+            }
+        }
+
+        ++m_stats.remaining_draws;
+    }
+
+    bool material_cp_validation_allows(const TrainingDataEntry& entry, int material_result) const
+    {
+        if (!m_options.material_cp_validation_enabled)
+            return true;
+
+        const int threshold = m_options.material_cp_validation_threshold;
+        const int cp = static_cast<int>(entry.score);
+        return material_result > 0 ? cp >= threshold : cp <= -threshold;
+    }
+
+    RelabelOptions m_options;
+    RelabelStats m_stats;
+};
 
 static int map_king(Square sq)
 {
@@ -474,15 +669,25 @@ struct Stream : AnyStream
 {
     using StorageType = StorageT;
 
-    Stream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename, cyclic, skipPredicate))
+    Stream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, RelabelOptions relabelOptions) :
+        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename, cyclic, skipPredicate)),
+        m_relabeler(relabelOptions),
+        m_filename(filename)
     {
+        m_relabeler.print_startup(m_filename.c_str());
+    }
+
+    virtual ~Stream()
+    {
+        m_relabeler.print_stats(m_filename.c_str());
     }
 
     virtual StorageT* next() = 0;
 
 protected:
     std::unique_ptr<training_data::BasicSfenInputStream> m_stream;
+    TrainingDataRelabeler m_relabeler;
+    std::string m_filename;
 };
 
 template <typename StorageT>
@@ -490,8 +695,8 @@ struct AsyncStream : Stream<StorageT>
 {
     using BaseType = Stream<StorageT>;
 
-    AsyncStream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        BaseType(1, filename, cyclic, skipPredicate)
+    AsyncStream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, RelabelOptions relabelOptions) :
+        BaseType(1, filename, cyclic, skipPredicate, relabelOptions)
     {
     }
 
@@ -517,7 +722,7 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+    FeaturedBatchStream(int concurrency, const char* filename, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, RelabelOptions relabelOptions) :
         BaseType(
             std::max(
                 1,
@@ -525,7 +730,8 @@ struct FeaturedBatchStream : Stream<StorageT>
             ),
             filename,
             cyclic,
-            skipPredicate
+            skipPredicate,
+            relabelOptions
         ),
         m_concurrency(concurrency),
         m_batch_size(batch_size)
@@ -544,6 +750,7 @@ struct FeaturedBatchStream : Stream<StorageT>
                 {
                     std::unique_lock lock(m_stream_mutex);
                     BaseType::m_stream->fill(entries, m_batch_size);
+                    BaseType::m_relabeler.relabel(entries);
                     if (entries.empty())
                     {
                         break;
@@ -666,38 +873,63 @@ std::function<bool(const TrainingDataEntry&)> make_skip_predicate(bool filtered,
 
 extern "C" {
 
-    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, const char* filename, int batch_size, bool cyclic, bool filtered, int random_fen_skipping)
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(
+        const char* feature_set_c,
+        int concurrency,
+        const char* filename,
+        int batch_size,
+        bool cyclic,
+        bool filtered,
+        int random_fen_skipping,
+        bool score_relabel_enabled,
+        int draw_relabel_score_threshold,
+        bool material_draw_relabel_enabled,
+        int material_relabel_max_material,
+        int material_relabel_min_ply,
+        int material_relabel_margin,
+        bool material_cp_validation_enabled,
+        int material_cp_validation_threshold)
     {
         auto skipPredicate = make_skip_predicate(filtered, random_fen_skipping);
+
+        RelabelOptions relabelOptions;
+        relabelOptions.score_relabel_enabled = score_relabel_enabled;
+        relabelOptions.draw_relabel_score_threshold = draw_relabel_score_threshold;
+        relabelOptions.material_draw_relabel_enabled = material_draw_relabel_enabled;
+        relabelOptions.material_relabel_max_material = material_relabel_max_material;
+        relabelOptions.material_relabel_min_ply = material_relabel_min_ply;
+        relabelOptions.material_relabel_margin = material_relabel_margin;
+        relabelOptions.material_cp_validation_enabled = material_cp_validation_enabled;
+        relabelOptions.material_cp_validation_threshold = material_cp_validation_threshold;
 
         std::string_view feature_set(feature_set_c);
         if (feature_set == "HalfKP")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate, relabelOptions);
         }
         else if (feature_set == "HalfKP^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate, relabelOptions);
         }
         else if (feature_set == "HalfKA")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate, relabelOptions);
         }
         else if (feature_set == "HalfKA^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate, relabelOptions);
         }
         else if (feature_set == "HalfKAv2")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKAv2>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate, relabelOptions);
         }
         else if (feature_set == "HalfKAv2^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKAv2Factorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate, relabelOptions);
         }
         else if (feature_set == "HalfKAv2^J")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKAv2JanggiFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKAv2JanggiFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate, relabelOptions);
         }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
@@ -725,7 +957,7 @@ extern "C" {
 
 int main()
 {
-    auto stream = create_sparse_batch_stream("HalfKP", 4, "10m_d3_q_2.binpack", 8192, true, false, 0);
+    auto stream = create_sparse_batch_stream("HalfKP", 4, "10m_d3_q_2.binpack", 8192, true, false, 0, false, 0, false, 30, 100, 1, false, 0);
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 1000; ++i)
     {
