@@ -20,6 +20,9 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <queue>
+#include <fstream>
+#include <cstdio>
 
 namespace Stockfish::Tools
 {
@@ -47,6 +50,240 @@ namespace Stockfish::Tools
             absolute_nudge = std::max(absolute_nudge, 0);
         }
     };
+
+
+    struct MineParams
+    {
+        std::string mode = "search-gap";
+        std::string input_filename = "in.bin";
+        std::string output_filename = "hard.bin";
+        std::string net;
+        std::string old_net;
+        std::string new_net;
+        std::uint64_t keep_count = 1000000;
+        std::uint64_t batch_size = 100000;
+    };
+
+    struct MinedEntry
+    {
+        int gap;
+        std::uint64_t ordinal;
+        PackedSfenValue psv;
+
+        bool operator>(const MinedEntry& other) const
+        {
+            if (gap != other.gap)
+                return gap > other.gap;
+            return ordinal > other.ordinal;
+        }
+    };
+
+    static bool load_nnue_file(const std::string& filename)
+    {
+        std::ifstream stream(filename, std::ios::binary);
+        if (!stream)
+        {
+            std::cerr << "ERROR: Could not open NNUE file " << filename << '\n';
+            return false;
+        }
+        currentNnueVariant = variants.find(Options["UCI_Variant"])->second;
+        if (!Eval::NNUE::load_eval(filename, stream))
+        {
+            std::cerr << "ERROR: Could not load NNUE file " << filename << '\n';
+            return false;
+        }
+        return true;
+    }
+
+    static void add_mined_entry(std::priority_queue<MinedEntry, std::vector<MinedEntry>, std::greater<MinedEntry>>& heap,
+                                std::uint64_t keep_count,
+                                int gap,
+                                std::uint64_t ordinal,
+                                const PackedSfenValue& psv)
+    {
+        if (keep_count == 0)
+            return;
+
+        MinedEntry entry{gap, ordinal, psv};
+        if (heap.size() < keep_count)
+            heap.push(entry);
+        else if (heap.top().gap < gap || (heap.top().gap == gap && heap.top().ordinal > ordinal))
+        {
+            heap.pop();
+            heap.push(entry);
+        }
+    }
+
+    static void write_mined_entries(std::priority_queue<MinedEntry, std::vector<MinedEntry>, std::greater<MinedEntry>>& heap,
+                                    const std::string& output_filename,
+                                    std::uint64_t batch_size)
+    {
+        std::vector<MinedEntry> entries;
+        entries.reserve(heap.size());
+        while (!heap.empty())
+        {
+            entries.emplace_back(heap.top());
+            heap.pop();
+        }
+
+        std::sort(entries.begin(), entries.end(), [](const MinedEntry& a, const MinedEntry& b) {
+            if (a.gap != b.gap)
+                return a.gap > b.gap;
+            return a.ordinal < b.ordinal;
+        });
+
+        std::remove(Tools::filename_with_extension(output_filename, Tools::BinSfenOutputStream::extension).c_str());
+        auto out = Tools::create_new_sfen_output(output_filename);
+        if (out == nullptr)
+        {
+            std::cerr << "Invalid output file type.\n";
+            return;
+        }
+
+        PSVector buffer;
+        buffer.reserve(batch_size);
+        for (const auto& entry : entries)
+        {
+            buffer.emplace_back(entry.psv);
+            if (buffer.size() >= batch_size)
+            {
+                out->write(buffer);
+                buffer.clear();
+            }
+        }
+        if (!buffer.empty())
+            out->write(buffer);
+
+        std::cout << "Wrote " << entries.size() << " mined positions to " << output_filename << "\n";
+    }
+
+    static void do_mine_search_gap(MineParams& params)
+    {
+        if (!load_nnue_file(params.net))
+            return;
+
+        Thread* th = Threads.main();
+        Position& pos = th->rootPos;
+        StateInfo si;
+        auto in = Tools::open_sfen_input_file(params.input_filename);
+        if (in == nullptr)
+        {
+            std::cerr << "Invalid input file type.\n";
+            return;
+        }
+
+        std::priority_queue<MinedEntry, std::vector<MinedEntry>, std::greater<MinedEntry>> heap;
+        std::uint64_t processed = 0;
+        for (;;)
+        {
+            auto v = in->next();
+            if (!v.has_value())
+                break;
+            auto psv = v.value();
+            pos.set_from_packed_sfen(psv.sfen, &si, th);
+            int gap = std::abs(int(psv.score) - int(Eval::NNUE::evaluate(pos)));
+            add_mined_entry(heap, params.keep_count, gap, processed, psv);
+            if (++processed % 1000000 == 0)
+                std::cout << "Processed " << processed << " positions. Current cutoff gap " << (heap.empty() ? 0 : heap.top().gap) << "\n";
+        }
+        write_mined_entries(heap, params.output_filename, params.batch_size);
+    }
+
+    static void do_mine_eval_disagree(MineParams& params)
+    {
+        const std::string temp_filename = params.output_filename + ".old_eval.tmp";
+        {
+            if (!load_nnue_file(params.old_net))
+                return;
+            Thread* th = Threads.main();
+            Position& pos = th->rootPos;
+            StateInfo si;
+            auto in = Tools::open_sfen_input_file(params.input_filename);
+            std::ofstream temp(temp_filename, std::ios::binary | std::ios::trunc);
+            if (in == nullptr || !temp)
+            {
+                std::cerr << "Invalid input file type or temporary file.\n";
+                return;
+            }
+            std::uint64_t processed = 0;
+            for (;;)
+            {
+                auto v = in->next();
+                if (!v.has_value())
+                    break;
+                pos.set_from_packed_sfen(v->sfen, &si, th);
+                std::int16_t eval = static_cast<std::int16_t>(std::clamp(int(Eval::NNUE::evaluate(pos)), int(std::numeric_limits<std::int16_t>::min()), int(std::numeric_limits<std::int16_t>::max())));
+                temp.write(reinterpret_cast<const char*>(&eval), sizeof(eval));
+                if (++processed % 1000000 == 0)
+                    std::cout << "Old net pass processed " << processed << " positions.\n";
+            }
+        }
+
+        if (!load_nnue_file(params.new_net))
+            return;
+        Thread* th = Threads.main();
+        Position& pos = th->rootPos;
+        StateInfo si;
+        auto in = Tools::open_sfen_input_file(params.input_filename);
+        std::ifstream temp(temp_filename, std::ios::binary);
+        if (in == nullptr || !temp)
+        {
+            std::cerr << "Invalid input file type or temporary file.\n";
+            std::remove(temp_filename.c_str());
+            return;
+        }
+
+        std::priority_queue<MinedEntry, std::vector<MinedEntry>, std::greater<MinedEntry>> heap;
+        std::uint64_t processed = 0;
+        for (;;)
+        {
+            auto v = in->next();
+            std::int16_t old_eval;
+            if (!v.has_value() || !temp.read(reinterpret_cast<char*>(&old_eval), sizeof(old_eval)))
+                break;
+            auto psv = v.value();
+            pos.set_from_packed_sfen(psv.sfen, &si, th);
+            int gap = std::abs(int(old_eval) - int(Eval::NNUE::evaluate(pos)));
+            add_mined_entry(heap, params.keep_count, gap, processed, psv);
+            if (++processed % 1000000 == 0)
+                std::cout << "New net pass processed " << processed << " positions. Current cutoff gap " << (heap.empty() ? 0 : heap.top().gap) << "\n";
+        }
+        std::remove(temp_filename.c_str());
+        write_mined_entries(heap, params.output_filename, params.batch_size);
+    }
+
+    void mine(std::istringstream& is)
+    {
+        MineParams params;
+        for (;;)
+        {
+            std::string token;
+            is >> token;
+            if (token.empty()) break;
+            if (token == "mode" || token == "--mode") is >> params.mode;
+            else if (token == "input_file" || token == "--input") is >> params.input_filename;
+            else if (token == "output_file" || token == "--output") is >> params.output_filename;
+            else if (token == "net" || token == "--net") is >> params.net;
+            else if (token == "old_net" || token == "--old-net") is >> params.old_net;
+            else if (token == "new_net" || token == "--new-net") is >> params.new_net;
+            else if (token == "keep_count" || token == "--keep-count") is >> params.keep_count;
+            else if (token == "batch_size" || token == "--batch-size") is >> params.batch_size;
+            else { std::cerr << "ERROR: Unknown option " << token << "\n"; return; }
+        }
+        params.batch_size = std::max<std::uint64_t>(1, params.batch_size);
+        std::cout << "Hard position mining mode=" << params.mode << " input=" << params.input_filename << " output=" << params.output_filename << " keep_count=" << params.keep_count << "\n";
+        if (params.mode == "search-gap")
+        {
+            if (params.net.empty()) { std::cerr << "ERROR: search-gap requires --net.\n"; return; }
+            do_mine_search_gap(params);
+        }
+        else if (params.mode == "eval-disagree")
+        {
+            if (params.old_net.empty() || params.new_net.empty()) { std::cerr << "ERROR: eval-disagree requires --old-net and --new-net.\n"; return; }
+            do_mine_eval_disagree(params);
+        }
+        else std::cerr << "ERROR: Unsupported mining mode " << params.mode << "\n";
+    }
 
     struct RescoreParams
     {
@@ -503,7 +740,8 @@ namespace Stockfish::Tools
     {
         const std::map<std::string, CommandFunc> subcommands = {
             { "nudged_static", &nudged_static },
-            { "rescore", &rescore }
+            { "rescore", &rescore },
+            { "mine", &mine }
         };
 
         Eval::NNUE::init();
