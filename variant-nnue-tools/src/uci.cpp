@@ -582,6 +582,17 @@ void UCI::loop(int argc, char* argv[]) {
       else if (token == "convert_epd") Tools::convert_epd(is);
       else if (token == "convert_bin_from_pgn_extract") Tools::convert_bin_from_pgn_extract(is);
       else if (token == "transform") Tools::transform(is);
+      else if (token == "mine" || token == "rescore")
+      {
+          // Convenience aliases for tool binaries or renamed executables.
+          // If the executable is named `transform`, invoking `transform mine ...`
+          // reaches this branch with `mine` as argv[1]; prepend the subcommand
+          // and reuse the normal transform dispatcher.
+          std::string rest;
+          std::getline(is >> std::ws, rest);
+          std::istringstream transform_is(token + (rest.empty() ? std::string() : " " + rest));
+          Tools::transform(transform_is);
+      }
       else if (token == "gather_statistics") Tools::Stats::gather_statistics(is);
 
       // Command to call qsearch(),search() directly for testing
