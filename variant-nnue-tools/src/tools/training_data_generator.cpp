@@ -1,4 +1,4 @@
-#include "training_data_generator.h"
+﻿#include "training_data_generator.h"
 
 #include "sfen_writer.h"
 #include "packed_sfen.h"
