@@ -6,6 +6,7 @@
 
 #include "thread.h"
 #include "position.h"
+#include "movegen.h"
 #include "evaluate.h"
 #include "misc.h"
 #include "search.h"
@@ -29,6 +30,28 @@
 
 namespace Stockfish::Tools
 {
+    // ★ 탐색 도중 발생하는 std::cout (info depth ...) 콘솔 출력을 완전 차단하는 RAII 클래스 ★
+    struct ScopedSilenceCout
+    {
+        std::streambuf* old_buf;
+        std::ofstream null_stream;
+
+        ScopedSilenceCout()
+        {
+#ifdef _WIN32
+            null_stream.open("NUL");
+#else
+            null_stream.open("/dev/null");
+#endif
+            old_buf = std::cout.rdbuf(null_stream.rdbuf());
+        }
+
+        ~ScopedSilenceCout()
+        {
+            std::cout.rdbuf(old_buf);
+        }
+    };
+
     using CommandFunc = void(*)(std::istringstream&);
 
     enum struct NudgedStaticMode
@@ -59,7 +82,10 @@ namespace Stockfish::Tools
     {
         std::string input_filename = "in.epd";
         std::string output_filename = "out.bin";
+        std::string net;
+        std::string variant;
         int depth = 3;
+        int threads = 1;
         std::uint64_t nodes = 0;
         int research_count = 0;
         bool keep_moves = true;
@@ -67,6 +93,7 @@ namespace Stockfish::Tools
         void enforce_constraints()
         {
             depth = std::max(1, depth);
+            threads = std::max(1, threads);
             nodes = std::max<std::uint64_t>(0, nodes);
             research_count = std::max(0, research_count);
         }
@@ -138,28 +165,26 @@ namespace Stockfish::Tools
         return std::string(Options["UCI_Variant"]);
     }
 
-    static std::string absolute_path_for_diagnostics(const std::string& filename)
+    static std::string absolute_path_for_diagnostics(const std::string& path)
     {
-        try
-        {
-            return std::filesystem::absolute(std::filesystem::path(filename)).string();
-        }
-        catch (const std::exception& e)
-        {
-            return std::string("<absolute path unavailable: ") + e.what() + ">";
-        }
+        std::error_code ec;
+        auto p = std::filesystem::absolute(path, ec);
+
+        if (ec)
+            return "<absolute path unavailable>";
+
+        return p.string();
     }
 
-    static std::string exists_for_diagnostics(const std::string& filename)
+    static std::string exists_for_diagnostics(const std::string& path)
     {
-        try
-        {
-            return std::filesystem::exists(std::filesystem::path(filename)) ? "yes" : "no";
-        }
-        catch (const std::exception& e)
-        {
-            return std::string("unknown: ") + e.what();
-        }
+        std::error_code ec;
+        bool exists = std::filesystem::exists(path, ec);
+
+        if (ec)
+            return "unknown";
+
+        return exists ? "yes" : "no";
     }
 
     static void print_nnue_load_diagnostics(const std::string& requested_filename,
@@ -201,9 +226,6 @@ namespace Stockfish::Tools
         if (std::string(Options["UCI_Variant"]) != variant)
             Options["UCI_Variant"] = variant;
 
-        // Use the same engine loading path as the EvalFile UCI option. This keeps
-        // working-directory, executable-directory, embedded/default-directory,
-        // format validation, and network lifetime behavior identical to engine eval.
         Options["EvalFile"] = filename;
         Eval::NNUE::init();
 
@@ -384,6 +406,8 @@ namespace Stockfish::Tools
         RescoreParams rescore_params;
         rescore_params.input_filename = temp_filename;
         rescore_params.output_filename = params.output_filename;
+        rescore_params.net = params.net;
+        rescore_params.variant = params.variant;
         rescore_params.depth = params.depth;
         rescore_params.nodes = params.nodes;
         rescore_params.research_count = params.research_count;
@@ -624,204 +648,183 @@ namespace Stockfish::Tools
     void do_rescore_epd(RescoreParams& params)
     {
         std::ifstream fens_file(params.input_filename);
-
-        auto next_fen = [&fens_file, mutex = std::mutex{}]() mutable -> std::optional<std::string>{
-            std::string fen;
-
-            std::unique_lock lock(mutex);
-
-            if (std::getline(fens_file, fen) && fen.size() >= 10)
-            {
-                return fen;
-            }
-            else
-            {
-                return std::nullopt;
-            }
-        };
-
-        PSVector buffer;
-        uint64_t batch_size = 10'000;
-
-        buffer.reserve(batch_size);
+        if (!fens_file.is_open())
+        {
+            std::cerr << "ERROR: Could not open input file " << params.input_filename << "\n";
+            return;
+        }
 
         auto out = Tools::create_new_sfen_output(params.output_filename);
+        if (out == nullptr)
+        {
+            std::cerr << "ERROR: Invalid output file type.\n";
+            return;
+        }
 
-        std::mutex mutex;
+        Thread* th = Threads.main();
+        Position& pos = th->rootPos;
+        StateInfo si;
+
+        PSVector buffer;
+        constexpr uint64_t batch_size = 10'000;
+        buffer.reserve(batch_size);
+
         uint64_t num_processed = 0;
+        std::string fen;
 
-        // About Search::Limits
-        // Be careful because this member variable is global and affects other threads.
-        auto& limits = Search::Limits;
+        while (std::getline(fens_file, fen))
+        {
+            if (fen.size() < 10)
+                continue;
 
-        // Make the search equivalent to the "go infinite" command. (Because it is troublesome if time management is done)
-        limits.infinite = true;
+            pos.set(variants.find(Options["UCI_Variant"])->second, fen, false, &si, th);
+            pos.state()->rule50 = 0;
 
-        // Since PV is an obstacle when displayed, erase it.
-        limits.silent = true;
+            Value search_value;
+            std::vector<Move> search_pv;
 
-        // If you use this, it will be compared with the accumulated nodes of each thread. Therefore, do not use it.
-        limits.nodes = 0;
-
-        // depth is also processed by the one passed as an argument of Tools::search().
-        limits.depth = 0;
-
-        Threads.execute_with_workers([&](auto& th){
-            Position& pos = th.rootPos;
-            StateInfo si;
-
-            for(;;)
+            // ★ 탐색 중에만 콘솔 출력을 차단하고 지정한 threads 사용 ★
             {
-                auto fen = next_fen();
-                if (!fen.has_value())
-                    return;
-
-                pos.set(variants.find(Options["UCI_Variant"])->second, *fen, false, &si, &th);
-                pos.state()->rule50 = 0;
-
-
+                ScopedSilenceCout silence;
                 for (int cnt = 0; cnt < params.research_count; ++cnt)
-                    Search::search(pos, params.depth, 1, params.nodes);
+                    Search::search(pos, params.depth, params.threads, params.nodes);
 
-                auto [search_value, search_pv] = Search::search(pos, params.depth, 1, params.nodes);
-
-                if (search_pv.empty())
-                    continue;
-
-                PackedSfenValue ps;
-                pos.sfen_pack(ps.sfen);
-                ps.score = search_value;
-                ps.move = search_pv[0];
-                ps.gamePly = 1;
-                ps.game_result = 0;
-                ps.padding = 0;
-
-                std::unique_lock lock(mutex);
-                buffer.emplace_back(ps);
-                if (buffer.size() >= batch_size)
-                {
-                    num_processed += buffer.size();
-
-                    out->write(buffer);
-                    buffer.clear();
-
-                    std::cout << "Processed " << num_processed << " positions.\n";
-                }
+                std::tie(search_value, search_pv) = Search::search(pos, params.depth, params.threads, params.nodes);
             }
-        });
-        Threads.wait_for_workers_finished();
+
+            if (search_pv.empty())
+                continue;
+
+            PackedSfenValue ps{};
+            pos.sfen_pack(ps.sfen);
+            ps.score = static_cast<std::int16_t>(search_value);
+            ps.move = search_pv[0];
+            ps.gamePly = 1;
+            ps.game_result = 0;
+            ps.padding = 0;
+
+            buffer.emplace_back(ps);
+            num_processed++;
+
+            if (num_processed % 10000 == 0)
+            {
+                std::cout << "Processed " << num_processed << " positions.\n";
+            }
+
+            if (buffer.size() >= batch_size)
+            {
+                out->write(buffer);
+                buffer.clear();
+            }
+        }
 
         if (!buffer.empty())
         {
-            num_processed += buffer.size();
-
             out->write(buffer);
             buffer.clear();
-
-            std::cout << "Processed " << num_processed << " positions.\n";
         }
 
-        std::cout << "Finished.\n";
+        std::cout << "Finished rescoring. Total processed: " << num_processed << " positions.\n";
     }
 
     void do_rescore_data(RescoreParams& params)
     {
-        // TODO: Use SfenReader once it works correctly in sequential mode. See issue #271
         auto in = Tools::open_sfen_input_file(params.input_filename);
-        auto readsome = [&in, mutex = std::mutex{}](int n) mutable -> PSVector {
+        if (in == nullptr)
+        {
+            std::cerr << "ERROR: Invalid input file type or failed to open " << params.input_filename << "\n";
+            return;
+        }
 
-            PSVector psv;
-            psv.reserve(n);
+        auto out = Tools::create_new_sfen_output(params.output_filename);
+        if (out == nullptr)
+        {
+            std::cerr << "ERROR: Invalid output file type.\n";
+            return;
+        }
 
-            std::unique_lock lock(mutex);
+        Thread* th = Threads.main();
+        Position& pos = th->rootPos;
+        StateInfo si;
 
-            for (int i = 0; i < n; ++i)
+        PSVector buffer;
+        constexpr uint64_t batch_size = 10'000;
+        buffer.reserve(batch_size);
+
+        uint64_t num_processed = 0;
+
+        for (;;)
+        {
+            auto v = in->next();
+            if (!v.has_value())
+                break;
+
+            auto ps = v.value();
+
+            pos.set_from_packed_sfen(ps.sfen, &si, th);
+
+            Value search_value;
+            std::vector<Move> search_pv;
+
+            // ★ 탐색 중에만 콘솔 출력을 차단하고 지정한 threads 사용 ★
             {
-                auto ps_opt = in->next();
-                if (ps_opt.has_value())
-                {
-                    psv.emplace_back(*ps_opt);
-                }
-                else
-                {
-                    break;
-                }
+                ScopedSilenceCout silence;
+                for (int cnt = 0; cnt < params.research_count; ++cnt)
+                    Search::search(pos, params.depth, params.threads, params.nodes);
+
+                std::tie(search_value, search_pv) = Search::search(pos, params.depth, params.threads, params.nodes);
             }
 
-            return psv;
-        };
+            if (search_pv.empty())
+                continue;
 
-        auto sfen_format = SfenOutputType::Bin;
+            ps.score = static_cast<std::int16_t>(search_value);
+            if (!params.keep_moves)
+                ps.move = search_pv[0];
+            ps.padding = 0;
 
-        auto out = SfenWriter(
-            params.output_filename,
-            Threads.size(),
-            std::numeric_limits<std::uint64_t>::max(),
-            sfen_format);
+            buffer.emplace_back(ps);
+            num_processed++;
 
-        // About Search::Limits
-        // Be careful because this member variable is global and affects other threads.
-        auto& limits = Search::Limits;
-
-        // Make the search equivalent to the "go infinite" command. (Because it is troublesome if time management is done)
-        limits.infinite = true;
-
-        // Since PV is an obstacle when displayed, erase it.
-        limits.silent = true;
-
-        // If you use this, it will be compared with the accumulated nodes of each thread. Therefore, do not use it.
-        limits.nodes = 0;
-
-        // depth is also processed by the one passed as an argument of Tools::search().
-        limits.depth = 0;
-
-        std::atomic<std::uint64_t> num_processed = 0;
-
-        Threads.execute_with_workers([&](auto& th){
-            Position& pos = th.rootPos;
-            StateInfo si;
-
-            for (;;)
+            if (num_processed % 10000 == 0)
             {
-                PSVector psv = readsome(5000);
-                if (psv.empty())
-                    break;
-
-                for(auto& ps : psv)
-                {
-                    pos.set_from_packed_sfen(ps.sfen, &si, &th);
-
-                    for (int cnt = 0; cnt < params.research_count; ++cnt)
-                        Search::search(pos, params.depth, 1, params.nodes);
-
-                    auto [search_value, search_pv] = Search::search(pos, params.depth, 1, params.nodes);
-
-                    if (search_pv.empty())
-                        continue;
-
-                    pos.sfen_pack(ps.sfen);
-                    ps.score = search_value;
-                    if (!params.keep_moves)
-                        ps.move = search_pv[0];
-                    ps.padding = 0;
-
-                    out.write(th.id(), ps);
-
-                    auto p = num_processed.fetch_add(1) + 1;
-                    if (p % 10000 == 0)
-                    {
-                        std::cout << "Processed " << p << " positions.\n";
-                    }
-                }
+                std::cout << "Processed " << num_processed << " positions.\n";
             }
-        });
-        Threads.wait_for_workers_finished();
 
-        std::cout << "Finished.\n";
+            if (buffer.size() >= batch_size)
+            {
+                out->write(buffer);
+                buffer.clear();
+            }
+        }
+
+        if (!buffer.empty())
+        {
+            out->write(buffer);
+            buffer.clear();
+        }
+
+        std::cout << "Finished rescoring. Total processed: " << num_processed << " positions.\n";
     }
 
     void do_rescore(RescoreParams& params)
     {
+        // 1. NNUE 모델 및 Variant 로드
+        if (!params.net.empty())
+        {
+            if (!load_nnue_file(params.net, params.variant))
+                return;
+        }
+        else if (!params.variant.empty())
+        {
+            if (variants.count(params.variant))
+                Options["UCI_Variant"] = params.variant;
+        }
+
+        // 2. Stockfish 내부 탐색 스레드 설정
+        Options["Threads"] = std::to_string(params.threads);
+        Threads.set(params.threads);
+
         if (ends_with(params.input_filename, ".epd"))
         {
             do_rescore_epd(params);
@@ -850,12 +853,18 @@ namespace Stockfish::Tools
 
             if (token == "depth" || token == "--depth")
                 is >> params.depth;
+            else if (token == "threads" || token == "--threads")
+                is >> params.threads;
             else if (token == "nodes" || token == "--nodes")
                 is >> params.nodes;
             else if (token == "input_file" || token == "--input")
                 is >> params.input_filename;
             else if (token == "output_file" || token == "--output")
                 is >> params.output_filename;
+            else if (token == "net" || token == "--net")
+                is >> params.net;
+            else if (token == "variant" || token == "--variant")
+                is >> params.variant;
             else if (token == "keep_moves" || token == "--keep-moves")
                 is >> params.keep_moves;
             else if (token == "research_count" || token == "--research-count")
@@ -871,9 +880,12 @@ namespace Stockfish::Tools
 
         std::cout << "Performing transform rescore with parameters:\n";
         std::cout << "depth               : " << params.depth << '\n';
+        std::cout << "threads             : " << params.threads << '\n';
         std::cout << "nodes               : " << params.nodes << '\n';
         std::cout << "input_file          : " << params.input_filename << '\n';
         std::cout << "output_file         : " << params.output_filename << '\n';
+        std::cout << "net                 : " << params.net << '\n';
+        std::cout << "variant             : " << params.variant << '\n';
         std::cout << "keep_moves          : " << params.keep_moves << '\n';
         std::cout << "research_count      : " << params.research_count << '\n';
         std::cout << '\n';
