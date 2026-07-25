@@ -32,11 +32,24 @@ Currently the following options are available:
 
 `input_file` - path to the input file. Default: in.bin.
 
-`output_file` - path to the output .bin file. The file is opened in append mode. Default: out.bin.
+`output_file` - path to the output .bin file. Default: out.bin.
 
 `depth` - the search depth to use for rescoring. Default: 3.
+
+`nodes` - optional node cap per searched position. Default: 0 (depth-only).
 
 `keep_moves` - whether to keep moves from the input file if available. Default: 1.
 
 `research_count` - number of additional searches of depth N done on the same position before using the eval. Default: 0.
 
+
+## `mine`
+
+`transform mine` filters packed `.bin` data to the hardest positions for NNUE
+training. It supports `--mode search-gap`, `--mode eval-disagree`, and
+`--mode search-gap-deep`. See [hard_position_mining.md](hard_position_mining.md)
+for the complete workflow and examples.
+
+The executable also accepts `mine ...` as a top-level convenience alias, which is
+useful if the same binary is renamed to `transform` and invoked as
+`transform mine ...` from a shell.
