@@ -23,7 +23,8 @@ Compares the stored search score in each `PackedSfenValue` with a current NNUE:
 ./stockfish transform mine --mode search-gap \
   --input train.bin \
   --output hard.bin \
-  --net current.nnue \
+  --net janggimodern-18.nnue \
+  --variant janggimodern \
   --keep-count 1000000 \
   --min-gap 50
 ```
@@ -52,9 +53,12 @@ the new network, computes absolute disagreement, and removes the sidecar.
 * `--keep-count N` keeps at most `N` positions using a bounded heap.
 * `--min-gap N` ignores positions with disagreement below `N`.
 * `--batch-size N` controls output buffering.
+* `--variant NAME` selects the variant before loading EvalFile. If omitted, the
+  tool infers it from a network filename prefix or uses the current `UCI_Variant`.
 
 Input is streamed from disk. Memory is bounded by `--keep-count`, not by the size
-of the input file.
+of the input file. Output ordering is not semantically important; the output file
+contains the selected hard records but is not guaranteed to be sorted by gap.
 
 ## Stage 2: deep rescore only mined positions
 
@@ -82,7 +86,8 @@ rescored data:
 ./stockfish transform mine --mode search-gap-deep \
   --input train.bin \
   --output hard_rescored.bin \
-  --net current.nnue \
+  --net janggimodern-18.nnue \
+  --variant janggimodern \
   --keep-count 1000000 \
   --depth 10 \
   --nodes 0
@@ -108,7 +113,8 @@ python variant-nnue-pytorch/scripts/hard_position_pipeline.py \
   --mine-output hard.bin \
   --rescored-output hard_rescored.bin \
   --mode search-gap \
-  --net current.nnue \
+  --net janggimodern-18.nnue \
+  --variant janggimodern \
   --keep-count 1000000 \
   --rescore-depth 10 \
   -- --gpus 1 --threads 8 --batch-size 16384
@@ -123,43 +129,3 @@ Omit `--rescored-output` to train directly on mined data.
   `rescore` -> train.
 * Net comparison/regression: generate -> `eval-disagree` between old and new nets
   -> inspect statistics or train on the disagreement subset.
-# Hard position mining
-
-Hard position mining filters an existing packed `.bin` training-data file down to
-positions where an NNUE network most needs additional training signal. It is
-implemented as a `transform mine` subcommand so it reuses the existing packed
-SFEN reader/writer, packed SFEN unpacking, `Position` reconstruction, and NNUE
-loader/evaluator.
-
-The tool keeps the `--keep-count` positions with the largest disagreement and
-writes them to a new packed `.bin` file. Input is streamed from disk; only the
-current top-k positions are retained in memory.
-
-## Search gap mode
-
-Compare each entry's stored search score against a current NNUE evaluation:
-
-```text
-transform mine --mode search-gap --input training.bin --output hard.bin --net current.nnue --keep-count 1000000
-```
-
-## Eval disagreement mode
-
-Compare two NNUE networks on the same positions:
-
-```text
-transform mine --mode eval-disagree --input training.bin --output hard.bin --old-net old.nnue --new-net new.nnue --keep-count 1000000
-```
-
-This mode uses two streaming passes. The old network pass writes a compact
-temporary sidecar file next to the output path, then the new network pass computes
-the final absolute gaps and removes the sidecar.
-
-## Notes
-
-* `--input` and `--output` are packed `.bin` paths.
-* `--batch-size` controls output buffering and defaults to `100000`.
-* `search-gap-deep` is intentionally not implemented here yet because it needs a
-  carefully integrated deep-search scheduling policy; the existing `transform
-  rescore` command remains the reusable building block for deep rescoring a mined
-  subset.

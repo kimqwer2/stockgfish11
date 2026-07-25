@@ -46,7 +46,9 @@ Currently the following options are available:
 ## `mine`
 
 `transform mine` filters packed `.bin` data to the hardest positions for NNUE
-training. It supports `--mode search-gap`, `--mode eval-disagree`, and
+training. Pass `--variant <name>` when the desired variant is not already set;
+otherwise the miner infers the variant from the NNUE filename prefix when possible.
+It supports `--mode search-gap`, `--mode eval-disagree`, and
 `--mode search-gap-deep`. See [hard_position_mining.md](hard_position_mining.md)
 for the complete workflow and examples.
 

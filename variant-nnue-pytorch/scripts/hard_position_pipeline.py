@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--net", help="NNUE for search-gap mining.")
     parser.add_argument("--old-net", help="Old NNUE for eval-disagree mining.")
     parser.add_argument("--new-net", help="New NNUE for eval-disagree mining.")
+    parser.add_argument("--variant", help="Variant to set before NNUE loading; if omitted, tools infer it from the NNUE filename when possible.")
     parser.add_argument("--keep-count", type=int, default=1_000_000, help="Positions to keep after mining.")
     parser.add_argument("--min-gap", type=int, default=0, help="Minimum disagreement needed to keep a position.")
     parser.add_argument("--rescore-depth", type=int, default=8, help="Depth for optional deep rescoring.")
@@ -40,6 +41,9 @@ def main():
     mine_cmd = [args.tools, "transform", "mine", "--mode", args.mode,
                 "--input", args.train_input, "--output", args.mine_output,
                 "--keep-count", args.keep_count, "--min-gap", args.min_gap]
+    if args.variant:
+        mine_cmd.extend(["--variant", args.variant])
+
     if args.mode == "search-gap":
         if not args.net:
             parser.error("--net is required for --mode search-gap")
