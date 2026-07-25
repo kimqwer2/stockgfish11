@@ -10,6 +10,7 @@
 #include "evaluate.h"
 #include "misc.h"
 #include "search.h"
+#include "uci.h"
 
 #include "nnue/evaluate_nnue.h"
 
@@ -27,6 +28,10 @@
 #include <cstdio>
 #include <filesystem>
 #include <utility>
+#include <chrono>
+#include <csignal>
+#include <iomanip>
+#include <sstream>
 
 namespace Stockfish::Tools
 {
@@ -89,6 +94,9 @@ namespace Stockfish::Tools
         std::uint64_t nodes = 0;
         int research_count = 0;
         bool keep_moves = true;
+        std::uint64_t log_interval = 1000;
+        std::uint64_t sample_count = 10;
+        std::uint64_t flush_interval = 1000;
 
         void enforce_constraints()
         {
@@ -96,6 +104,8 @@ namespace Stockfish::Tools
             threads = std::max(1, threads);
             nodes = std::max<std::uint64_t>(0, nodes);
             research_count = std::max(0, research_count);
+            log_interval = std::max<std::uint64_t>(1, log_interval);
+            flush_interval = std::max<std::uint64_t>(1, flush_interval);
         }
     };
 
@@ -282,6 +292,13 @@ namespace Stockfish::Tools
             {
                 out->write(buffer);
                 buffer.clear();
+                out.reset();
+                out = Tools::create_new_sfen_output(output_filename);
+                if (out == nullptr)
+                {
+                    std::cerr << "ERROR: Failed to reopen output after flush.\n";
+                    return;
+                }
             }
         }
         if (!buffer.empty())
@@ -645,6 +662,79 @@ namespace Stockfish::Tools
         do_nudged_static(params);
     }
 
+
+    static std::uint64_t estimate_packed_position_count(const std::string& input_filename)
+    {
+        const std::string bin = Tools::filename_with_extension(input_filename, Tools::BinSfenOutputStream::extension);
+        std::error_code ec;
+        if (!std::filesystem::exists(bin, ec)) return 0;
+        const auto bytes = std::filesystem::file_size(bin, ec);
+        return ec ? 0 : bytes / sizeof(PackedSfenValue);
+    }
+
+    static Search::ValueAndPV threaded_search(Position& pos, const RescoreParams& params, int& completed_depth, std::uint64_t& nodes)
+    {
+        StateListPtr states(new std::deque<StateInfo>(1));
+        states->back() = *pos.state();
+        Search::LimitsType limits;
+        limits.depth = params.depth;
+        limits.nodes = static_cast<int64_t>(params.nodes);
+        limits.silent = true;
+        Threads.start_thinking(pos, states, limits, false);
+        Threads.main()->wait_for_search_finished();
+        Thread* best = Threads.main()->rootMoves.empty() ? Threads.main() : Threads.get_best_thread();
+        completed_depth = best->completedDepth;
+        nodes = Threads.nodes_searched();
+        if (best->rootMoves.empty()) return {};
+        return {best->rootMoves[0].score, best->rootMoves[0].pv};
+    }
+
+
+    static std::string g_rescore_checkpoint_filename;
+    static std::uint64_t g_rescore_current_index = 0;
+    static PackedSfenValue g_rescore_current_ps{};
+
+    static std::string packed_sfen_to_hex(const PackedSfen& sfen)
+    {
+        std::ostringstream os;
+        os << std::hex << std::setfill('0');
+        for (std::uint8_t byte : sfen.data)
+            os << std::setw(2) << unsigned(byte);
+        return os.str();
+    }
+
+    static void write_rescore_checkpoint(std::uint64_t index, const PackedSfenValue& ps, const std::string& note)
+    {
+        if (g_rescore_checkpoint_filename.empty())
+            return;
+        std::ofstream checkpoint(g_rescore_checkpoint_filename, std::ios::trunc);
+        if (!checkpoint)
+            return;
+        checkpoint << "note: " << note << "\n"
+                   << "position_index: " << index << "\n"
+                   << "score: " << ps.score << "\n"
+                   << "move: " << ps.move << "\n"
+                   << "gamePly: " << ps.gamePly << "\n"
+                   << "game_result: " << int(ps.game_result) << "\n"
+                   << "packed_sfen_hex: " << packed_sfen_to_hex(ps.sfen) << "\n";
+    }
+
+    static void rescore_signal_handler(int signal)
+    {
+        write_rescore_checkpoint(g_rescore_current_index, g_rescore_current_ps, std::string("fatal signal ") + std::to_string(signal));
+        std::_Exit(128 + signal);
+    }
+
+    static void install_rescore_signal_handlers(const std::string& checkpoint_filename)
+    {
+        g_rescore_checkpoint_filename = checkpoint_filename;
+        std::signal(SIGABRT, rescore_signal_handler);
+        std::signal(SIGSEGV, rescore_signal_handler);
+#ifdef SIGBUS
+        std::signal(SIGBUS, rescore_signal_handler);
+#endif
+    }
+
     void do_rescore_epd(RescoreParams& params)
     {
         std::ifstream fens_file(params.input_filename);
@@ -666,7 +756,7 @@ namespace Stockfish::Tools
         StateInfo si;
 
         PSVector buffer;
-        constexpr uint64_t batch_size = 10'000;
+        const uint64_t batch_size = params.flush_interval;
         buffer.reserve(batch_size);
 
         uint64_t num_processed = 0;
@@ -735,7 +825,7 @@ namespace Stockfish::Tools
             std::cerr << "ERROR: Invalid input file type or failed to open " << params.input_filename << "\n";
             return;
         }
-
+        std::remove(Tools::filename_with_extension(params.output_filename, Tools::BinSfenOutputStream::extension).c_str());
         auto out = Tools::create_new_sfen_output(params.output_filename);
         if (out == nullptr)
         {
@@ -746,65 +836,83 @@ namespace Stockfish::Tools
         Thread* th = Threads.main();
         Position& pos = th->rootPos;
         StateInfo si;
-
         PSVector buffer;
-        constexpr uint64_t batch_size = 10'000;
+        const uint64_t batch_size = params.flush_interval;
         buffer.reserve(batch_size);
 
-        uint64_t num_processed = 0;
+        uint64_t num_processed = 0, pv_changed = 0, total_nodes = 0, total_depth = 0, total_ms = 0;
+        install_rescore_signal_handlers(params.output_filename + ".checkpoint.txt");
+        std::cout << "Rescore checkpoint file: " << g_rescore_checkpoint_filename << "\n"
+                  << "Rescore input position estimate: " << estimate_packed_position_count(params.input_filename) << "\n"
+                  << "Rescore depth: " << params.depth << " nodes: " << params.nodes
+                  << " Threads: " << Threads.size() << " loaded NNUE: " << Eval::NNUE::eval_file_loaded << "\n";
 
         for (;;)
         {
             auto v = in->next();
             if (!v.has_value())
                 break;
-
             auto ps = v.value();
-
+            const auto current_index = num_processed + 1;
+            g_rescore_current_index = current_index;
+            g_rescore_current_ps = ps;
+            write_rescore_checkpoint(current_index, ps, "before search");
+            const auto old_score = ps.score;
+            const auto old_move = Move(ps.move);
             pos.set_from_packed_sfen(ps.sfen, &si, th);
 
             Value search_value;
             std::vector<Move> search_pv;
-
-            // ★ 탐색 중에만 콘솔 출력을 차단하고 지정한 threads 사용 ★
+            int completed_depth = 0;
+            std::uint64_t search_nodes = 0;
+            const auto start_time = std::chrono::steady_clock::now();
             {
                 ScopedSilenceCout silence;
                 for (int cnt = 0; cnt < params.research_count; ++cnt)
-                    Search::search(pos, params.depth, params.threads, params.nodes);
-
-                std::tie(search_value, search_pv) = Search::search(pos, params.depth, params.threads, params.nodes);
+                    threaded_search(pos, params, completed_depth, search_nodes);
+                std::tie(search_value, search_pv) = threaded_search(pos, params, completed_depth, search_nodes);
             }
-
             if (search_pv.empty())
                 continue;
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
+            total_ms += elapsed_ms; total_nodes += search_nodes; total_depth += completed_depth;
 
             ps.score = static_cast<std::int16_t>(search_value);
+            if (old_move != search_pv[0])
+                ++pv_changed;
             if (!params.keep_moves)
                 ps.move = search_pv[0];
             ps.padding = 0;
-
             buffer.emplace_back(ps);
-            num_processed++;
+            ++num_processed;
 
-            if (num_processed % 10000 == 0)
-            {
-                std::cout << "Processed " << num_processed << " positions.\n";
-            }
+            if (num_processed <= params.sample_count)
+                std::cout << "Sample " << num_processed << " index: " << current_index << " old score: " << old_score << " new score: " << ps.score
+                          << " old move: " << UCI::move(pos, old_move) << " new move: " << UCI::move(pos, search_pv[0])
+                          << " completed depth: " << completed_depth << " nodes: " << search_nodes << " time ms: " << elapsed_ms << "\n";
+            if (num_processed % params.log_interval == 0)
+                std::cout << "Processed " << num_processed << " last index: " << current_index
+                          << " avg nodes: " << total_nodes / num_processed
+                          << " avg depth: " << double(total_depth) / double(num_processed)
+                          << " avg search time ms: " << total_ms / num_processed
+                          << " PV changed count: " << pv_changed << "\n";
 
             if (buffer.size() >= batch_size)
             {
                 out->write(buffer);
                 buffer.clear();
+                out.reset();
+                out = Tools::create_new_sfen_output(params.output_filename);
+                if (out == nullptr)
+                {
+                    std::cerr << "ERROR: Failed to reopen output after flush.\n";
+                    return;
+                }
             }
         }
-
         if (!buffer.empty())
-        {
             out->write(buffer);
-            buffer.clear();
-        }
-
-        std::cout << "Finished rescoring. Total processed: " << num_processed << " positions.\n";
+        std::cout << "Finished rescoring. Total processed: " << num_processed << " positions. PV changed count: " << pv_changed << "\n";
     }
 
     void do_rescore(RescoreParams& params)
@@ -869,6 +977,12 @@ namespace Stockfish::Tools
                 is >> params.keep_moves;
             else if (token == "research_count" || token == "--research-count")
                 is >> params.research_count;
+            else if (token == "log_interval" || token == "--log-interval")
+                is >> params.log_interval;
+            else if (token == "sample_count" || token == "--sample-count")
+                is >> params.sample_count;
+            else if (token == "flush_interval" || token == "--flush-interval")
+                is >> params.flush_interval;
             else
             {
                 std::cout << "ERROR: Unknown option " << token << ". Exiting...\n";
@@ -888,6 +1002,9 @@ namespace Stockfish::Tools
         std::cout << "variant             : " << params.variant << '\n';
         std::cout << "keep_moves          : " << params.keep_moves << '\n';
         std::cout << "research_count      : " << params.research_count << '\n';
+        std::cout << "log_interval        : " << params.log_interval << '\n';
+        std::cout << "sample_count        : " << params.sample_count << '\n';
+        std::cout << "flush_interval       : " << params.flush_interval << '\n';
         std::cout << '\n';
 
         do_rescore(params);
